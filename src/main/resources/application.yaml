@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: jarvis
+  ai:
+    openai:
+      # 公司 AI 网关（OpenAI 兼容接口），完整地址为 https://aigateway.mxbc.net/v1/chat/completions
+      base-url: https://aigateway.mxbc.net/v1
+      api-key: sk-aigw-IA7nb9o.ZnpewESUFAMxWNClaJoIqR8QZXnYGVuh
+      chat:
+        options:
+          model: qwen3.8-27b
+          temperature: 0.7
+
+server:
+  port: 8081
