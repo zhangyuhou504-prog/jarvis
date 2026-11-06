@@ -5,10 +5,12 @@ import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.service.ChatService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
 
 /**
  * 对话接口。
@@ -31,5 +33,19 @@ public class ChatController {
     @PostMapping("/chat")
     public ChatResponse chat(@Valid @RequestBody ChatRequest request) {
         return chatService.chat(request);
+    }
+
+    /**
+     * 流式对话接口（SSE）。
+     *
+     * <p>POST /jarvis/chat/stream，响应类型为 {@code text/event-stream}，
+     * 模型生成的文本会逐段推送给客户端。</p>
+     *
+     * @param request 对话请求
+     * @return 文本分片流
+     */
+    @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> chatStream(@Valid @RequestBody ChatRequest request) {
+        return chatService.chatStream(request);
     }
 }
