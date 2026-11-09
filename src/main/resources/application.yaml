@@ -13,3 +13,8 @@ spring:
 
 server:
   port: 8081
+
+jarvis:
+  chat:
+    # 流式：相邻两个 chunk 之间的最大等待秒数，超时则中断并优雅收尾
+    stream-element-timeout-seconds: 60
