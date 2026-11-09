@@ -1,6 +1,5 @@
 package com.example.jarvis.service;
 
-import com.example.jarvis.config.AiConfig;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
@@ -37,7 +36,7 @@ public class ChatService {
 
     private final ChatClient chatClient;
     private final WebClient gatewayWebClient;
-    private final AiConfig aiConfig;
+    private final PromptTemplateService promptTemplateService;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -109,7 +108,7 @@ public class ChatService {
         // 任务1：标记是否发生过异常，便于 doFinally 区分结束原因。
         AtomicBoolean errored = new AtomicBoolean(false);
 
-        Map<String, Object> body = streamBody(request.getMessage());
+        Map<String, Object> body = streamBody(request.getMessage(), resolveSystemPrompt(request));
 
         // 打印实际请求参数（仅调试用，序列化失败不影响主流程）
         try {
@@ -153,22 +152,43 @@ public class ChatService {
     /**
      * 构建流式请求体（OpenAI 兼容格式）。
      *
-     * @param message 用户消息
+     * @param message      用户消息
+     * @param systemPrompt 本轮系统提示词（默认或模板渲染结果）
      * @return 请求体
      */
-    private Map<String, Object> streamBody(String message) {
+    private Map<String, Object> streamBody(String message, String systemPrompt) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
         body.put("stream", true);
         body.put("enable_thinking", enableThinking);
         Map<String, String> systemMsg = new LinkedHashMap<>();
         systemMsg.put("role", "system");
-        systemMsg.put("content", aiConfig.getSystemPrompt());
+        systemMsg.put("content", systemPrompt);
         Map<String, String> userMsg = new LinkedHashMap<>();
         userMsg.put("role", "user");
         userMsg.put("content", message);
         body.put("messages", List.of(systemMsg, userMsg));
         return body;
+    }
+
+    /**
+     * 解析本轮对话使用的系统提示词。
+     *
+     * <p>统一走模板注册表：不传 {@code template} 时用默认模板；传了则按标识渲染
+     * （模板标识未注册会抛 {@link IllegalArgumentException}，由全局异常处理转 400）。
+     * 模板变量由 Jarvis 内部维护，上游只传标识。</p>
+     *
+     * @param request 对话请求
+     * @return 本轮使用的系统提示词
+     */
+    private String resolveSystemPrompt(ChatRequest request) {
+        String templateName = (request.getTemplate() == null || request.getTemplate().isBlank())
+                ? PromptTemplateService.DEFAULT_TEMPLATE
+                : request.getTemplate();
+        String prompt = promptTemplateService.render(templateName);
+        // 打印最终生成的 Prompt，便于确认模板选择与变量填充正确
+        log.info("模板[{}]渲染后的系统提示词: {}", templateName, prompt);
+        return prompt;
     }
 
     /**

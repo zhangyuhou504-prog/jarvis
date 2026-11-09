@@ -61,6 +61,17 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 业务参数错误（如模板不存在、模板变量缺失）——由调用方输入引起，返回 400。
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleIllegalArgument(IllegalArgumentException e) {
+        log.warn("请求参数错误: {}", e.getMessage());
+        Map<String, Object> body = new HashMap<>();
+        body.put("error", e.getMessage());
+        return ResponseEntity.badRequest().body(body);
+    }
+
+    /**
      * 客户端在响应过程中断开连接（流式接口常见：用户关页面、curl 超时等）。
      *
      * <p>此时响应已提交、客户端已离开，无法也无需再写任何响应。
