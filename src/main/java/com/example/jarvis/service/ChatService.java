@@ -4,6 +4,7 @@ import com.example.jarvis.config.AiConfig;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import lombok.RequiredArgsConstructor;
@@ -36,6 +37,7 @@ public class ChatService {
 
     private final ChatClient chatClient;
     private final WebClient gatewayWebClient;
+    private final AiConfig aiConfig;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -43,14 +45,25 @@ public class ChatService {
     private static final JsonMapper JSON = new JsonMapper();
 
     /**
-     * 流式：相邻两个 chunk 之间的最大等待时间（秒）。
-     * 覆盖“连接挂起”与“生成中断”两种长时间无响应场景。
+     * 流式：相邻两个原始 SSE 事件（网关 chunk）之间的最大等待时间（秒）。
+     * 覆盖"连接挂起"与"生成中断"两种长时间无响应场景。
+     * 注意：这是网关事件级超时，推理模型思考期间网关持续发 chunk，不会触发。
      */
-    @Value("${jarvis.chat.stream-element-timeout-seconds:60}")
+    @Value("${jarvis.chat.stream-element-timeout-seconds:120}")
     private long streamElementTimeoutSeconds;
 
     @Value("${spring.ai.openai.chat.options.model}")
     private String model;
+
+    /**
+     * 是否启用模型思考（reasoning）阶段。
+     *
+     * <p>默认 {@code false}：{@code qwen3.8-27b} 是推理模型，思考阶段网关有时整段缓冲、
+     * 长时间不推任何 chunk（已实测静默超 60s），会导致流式超时或前端长时间无反馈。
+     * 关闭思考后网关 2 秒内即开始推流，响应稳定。需要更强推理质量时再置为 {@code true}。</p>
+     */
+    @Value("${jarvis.chat.enable-thinking:false}")
+    private boolean enableThinking;
 
     /**
      * 处理一轮对话，返回模型回答（非流式）。
@@ -96,19 +109,31 @@ public class ChatService {
         // 任务1：标记是否发生过异常，便于 doFinally 区分结束原因。
         AtomicBoolean errored = new AtomicBoolean(false);
 
+        Map<String, Object> body = streamBody(request.getMessage());
+
+        // 打印实际请求参数（仅调试用，序列化失败不影响主流程）
+        try {
+            log.info("模型请求参数: {}", JSON.writeValueAsString(body));
+        } catch (JsonProcessingException e) {
+            log.warn("请求参数序列化失败: {}", e.getMessage());
+        }
+
         return gatewayWebClient.post()
                 .uri("/chat/completions")
-                .bodyValue(streamBody(request.getMessage()))
+                .bodyValue(body)
                 .retrieve()
                 .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
+                // 任务1：元素间超时——放在原始 SSE 事件级：网关只要还在发任何 chunk（含推理模型思考阶段的
+                // reasoning chunk、空内容 chunk）就不算超时；只有网关真正静默超过该时长（连接挂起、生成中断）才中断。
+                // 注意：不能放在 filter 空内容之后，否则推理模型思考期（content 全为空）会被误判为无响应。
+                .timeout(Duration.ofSeconds(streamElementTimeoutSeconds))
                 .map(ServerSentEvent::data)
+                .doOnNext(data -> log.info("原始模型chunk: {}", data))
                 .filter(Objects::nonNull)
                 .map(this::extractContent)
                 .filter(content -> !content.isEmpty())
                 // 任务2：每个 chunk 旁路拼接到完整答案（实时推送与收集并行）
                 .doOnNext(fullAnswer::append)
-                // 任务1：元素间超时——订阅后或上一个 chunk 后超过该时长无新数据即中断
-                .timeout(Duration.ofSeconds(streamElementTimeoutSeconds))
                 // 任务1：识别流中异常（模型调用失败 / 生成中报错 / 超时）
                 .doOnError(err -> {
                     errored.set(true);
@@ -135,9 +160,10 @@ public class ChatService {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
         body.put("stream", true);
+        body.put("enable_thinking", enableThinking);
         Map<String, String> systemMsg = new LinkedHashMap<>();
         systemMsg.put("role", "system");
-        systemMsg.put("content", AiConfig.SYSTEM_PROMPT);
+        systemMsg.put("content", aiConfig.getSystemPrompt());
         Map<String, String> userMsg = new LinkedHashMap<>();
         userMsg.put("role", "user");
         userMsg.put("content", message);

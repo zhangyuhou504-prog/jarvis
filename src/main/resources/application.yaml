@@ -16,5 +16,10 @@ server:
 
 jarvis:
   chat:
-    # 流式：相邻两个 chunk 之间的最大等待秒数，超时则中断并优雅收尾
-    stream-element-timeout-seconds: 60
+    # 是否启用模型思考（reasoning）阶段。
+    # 默认 false：qwen3.8-27b 思考阶段网关有时整段缓冲、长时间不推 chunk，会导致流式超时；
+    # 关闭后 2 秒内即开始推流，响应稳定。需要更强推理质量时改为 true。
+    enable-thinking: false
+    # 流式：相邻两个原始 SSE 事件之间的最大等待秒数，超时则中断并优雅收尾。
+    # 关闭思考后首 chunk 约 2s，120s 仅作真正挂起的兜底。
+    stream-element-timeout-seconds: 120

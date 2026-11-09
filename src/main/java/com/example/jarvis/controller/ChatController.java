@@ -3,6 +3,7 @@ package com.example.jarvis.controller;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.service.ChatService;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
@@ -45,7 +46,7 @@ public class ChatController {
      * @return 文本分片流
      */
     @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> chatStream(@Valid @RequestBody ChatRequest request) {
+    public Flux<String> chatStream(@Valid @RequestBody ChatRequest request) throws JsonProcessingException {
         return chatService.chatStream(request);
     }
 }
