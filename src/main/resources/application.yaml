@@ -7,8 +7,7 @@ spring:
       base-url: https://aigateway.mxbc.net/v1
       api-key: sk-aigw-IA7nb9o.ZnpewESUFAMxWNClaJoIqR8QZXnYGVuh
       chat:
-        # Spring AI 底层 OpenAI SDK 的 HTTP 超时（默认 60s）。
-        # 网关长回答常超 60s，调大到 120s 与 LangChain4j 实验对齐，排除超时干扰。
+        # Spring AI 底层 OpenAI SDK 的 HTTP 超时（默认 60s），网关长回答常超 60s
         timeout: 120s
         options:
           model: qwen3.8-27b
@@ -18,6 +17,31 @@ server:
   port: 8081
 
 jarvis:
+  llm:
+    # 默认模型（WebClient 模型调用层使用）
+    default-model: mxbc-qwen
+
+    connections:
+      # 硅基流动
+      gjld:
+        base-url: https://api.siliconflow.cn/v1
+        api-key: sk-kcvodeppmiwvapgpgcflkjsjrmoocsfjcbgqgutmoyxvzttu
+      mxbc:
+        base-url: https://aigateway.mxbc.net/v1
+        api-key: sk-aigw-IA7nb9o.ZnpewESUFAMxWNClaJoIqR8QZXnYGVuh
+
+    models:
+      gjld-qwen:
+        connection: gjld
+        model-name: Qwen/Qwen3.8-27B
+        temperature: 0.7
+        max-tokens: 4096
+      mxbc-qwen:
+        connection: mxbc
+        model-name: qwen3.8-27b
+        temperature: 0.7
+        max-tokens: 4096
+
   chat:
     # 是否启用模型思考（reasoning）阶段。
     # 默认 false：qwen3.8-27b 思考阶段网关有时整段缓冲、长时间不推 chunk，会导致流式超时；

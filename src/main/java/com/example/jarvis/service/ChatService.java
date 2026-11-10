@@ -1,5 +1,6 @@
 package com.example.jarvis.service;
 
+import com.example.jarvis.config.LlmProperties;
 import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.domain.Conversation;
 import com.example.jarvis.dto.ChatRequest;
@@ -41,6 +42,7 @@ public class ChatService {
     private final WebClient gatewayWebClient;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
+    private final LlmProperties llmProperties;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -55,9 +57,6 @@ public class ChatService {
     @Value("${jarvis.chat.stream-element-timeout-seconds:120}")
     private long streamElementTimeoutSeconds;
 
-    @Value("${spring.ai.openai.chat.options.model}")
-    private String model;
-
     /**
      * 是否启用模型思考（reasoning）阶段。
      *
@@ -67,6 +66,22 @@ public class ChatService {
      */
     @Value("${jarvis.chat.enable-thinking:false}")
     private boolean enableThinking;
+
+    /**
+     * 解析默认模型的配置（模型名、所属连接）。
+     *
+     * <p>模型名与 {@code AiConfig} 中 {@code gatewayWebClient} 的连接必须同源，
+     * 否则会出现"往 SiliconFlow 发 mxbc 内部别名"这类跨平台模型名不匹配（400）。</p>
+     *
+     * @return 默认模型配置
+     */
+    private LlmProperties.Model defaultModel() {
+        LlmProperties.Model model = llmProperties.models().get(llmProperties.defaultModel());
+        if (model == null) {
+            throw new IllegalStateException("默认模型不存在: " + llmProperties.defaultModel());
+        }
+        return model;
+    }
 
     /**
      * 多轮对话携带的历史消息条数上限（user/assistant 各算一条）。
@@ -218,7 +233,7 @@ public class ChatService {
      */
     private Map<String, Object> streamBody(List<ChatMessage> history, String message, String systemPrompt) {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", model);
+        body.put("model", defaultModel().modelName());
         body.put("stream", true);
         body.put("enable_thinking", enableThinking);
 

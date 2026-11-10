@@ -3,31 +3,31 @@ package com.example.jarvis.config;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 /**
- * AI 配置：构建 Jarvis 使用的 {@link ChatClient} 与网关 {@link WebClient}。
+ * AI 配置：系统提示词 + Spring AI {@link ChatClient} + 模型调用层 {@link WebClient}。
  *
- * <p>OpenAI 兼容模型客户端（{@code OpenAiChatModel}）由 Spring AI 根据
- * {@code application.yaml} 中的 {@code spring.ai.openai.*} 配置自动装配，
- * 这里基于它构建一个带默认系统提示词的 {@link ChatClient}，
- * 作为 Jarvis 非流式对话的统一入口。</p>
+ * <p>三个职责：</p>
+ * <ul>
+ *   <li>系统提示词：从 {@code classpath:prompts/system-prompt.md} 启动时一次性读入（fail-fast）</li>
+ *   <li>{@link ChatClient}：基于 Spring AI 自动装配的 {@code ChatModel}（非流式链路）</li>
+ *   <li>{@link WebClient}：按 {@link LlmProperties} 中默认模型对应的连接构建（流式链路）</li>
+ * </ul>
  *
- * <p>系统提示词从独立文件 {@code classpath:prompts/system-prompt.md} 加载，
- * 与代码解耦，便于维护和版本管理；启动时一次性读入并缓存，文件缺失则启动失败（fail-fast）。</p>
- *
- * <p>另外提供一个直连网关的 {@link WebClient}，用于流式对话：
- * 网关的 SSE chunk 存在不带 {@code id} 等字段的精简格式，
- * Spring AI 2.0 底层的 OpenAI SDK 会对其严格校验而中断流，
- * 因此流式链路改为直接消费网关 SSE 并自行解析。</p>
+ * <p>流式走 WebClient 直连的原因：网关 SSE chunk 存在不带 {@code id} 等字段的精简格式，
+ * Spring AI 2.0 底层 OpenAI SDK 严格校验会中断流（已对照实验验证）。</p>
  */
 @Configuration
+@EnableConfigurationProperties(LlmProperties.class)
 public class AiConfig {
 
     /**
@@ -35,15 +35,9 @@ public class AiConfig {
      */
     private final String systemPrompt;
 
-    private final String gatewayBaseUrl;
-    private final String gatewayApiKey;
-
-    public AiConfig(@Value("classpath:prompts/system-prompt.md") Resource systemPromptResource,
-                    @Value("${spring.ai.openai.base-url}") String gatewayBaseUrl,
-                    @Value("${spring.ai.openai.api-key:}") String gatewayApiKey) throws IOException {
+    public AiConfig(@Value("classpath:prompts/system-prompt.md") Resource systemPromptResource)
+            throws IOException {
         this.systemPrompt = new String(systemPromptResource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        this.gatewayBaseUrl = gatewayBaseUrl;
-        this.gatewayApiKey = gatewayApiKey;
     }
 
     /**
@@ -69,15 +63,29 @@ public class AiConfig {
     }
 
     /**
-     * 构建直连公司 AI 网关的 {@link WebClient}（用于流式对话）。
+     * 构建模型调用层 {@link WebClient}：按 {@link LlmProperties} 中默认模型解析连接。
      *
-     * @return 已配置网关地址与鉴权头的 {@link WebClient}
+     * <p>配置错误（默认模型/连接不存在）在启动时 fail-fast。</p>
+     *
+     * @param properties 统一模型配置
+     * @return 已配置连接地址与鉴权头的 {@link WebClient}
      */
     @Bean
-    public WebClient gatewayWebClient() {
-        return WebClient.builder()
-                .baseUrl(gatewayBaseUrl)
-                .defaultHeader("Authorization", "Bearer " + gatewayApiKey)
-                .build();
+    public WebClient gatewayWebClient(LlmProperties properties) {
+        LlmProperties.Model model = properties.models().get(properties.defaultModel());
+        if (model == null) {
+            throw new IllegalStateException("默认模型不存在: " + properties.defaultModel());
+        }
+        LlmProperties.Connection connection = properties.connections().get(model.connection());
+        if (connection == null) {
+            throw new IllegalStateException("模型连接不存在: " + model.connection());
+        }
+
+        WebClient.Builder builder = WebClient.builder()
+                .baseUrl(connection.baseUrl());
+        if (connection.apiKey() != null && !connection.apiKey().isBlank()) {
+            builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + connection.apiKey());
+        }
+        return builder.build();
     }
 }
