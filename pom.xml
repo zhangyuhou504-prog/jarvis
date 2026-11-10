@@ -65,6 +65,14 @@
 			<artifactId>spring-ai-starter-model-openai</artifactId>
 		</dependency>
 
+		<!-- LangChain4j：实验 B 用，自带 OpenAI 实现（不依赖 OpenAI 官方 SDK），
+		     与 Spring AI 2.0.2 对照，验证网关缺 id 的 chunk 是否同样报错 -->
+		<dependency>
+			<groupId>dev.langchain4j</groupId>
+			<artifactId>langchain4j-open-ai</artifactId>
+			<version>1.23.0</version>
+		</dependency>
+
 		<dependency>
 			<groupId>org.projectlombok</groupId>
 			<artifactId>lombok</artifactId>

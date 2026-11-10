@@ -7,6 +7,9 @@ spring:
       base-url: https://aigateway.mxbc.net/v1
       api-key: sk-aigw-IA7nb9o.ZnpewESUFAMxWNClaJoIqR8QZXnYGVuh
       chat:
+        # Spring AI 底层 OpenAI SDK 的 HTTP 超时（默认 60s）。
+        # 网关长回答常超 60s，调大到 120s 与 LangChain4j 实验对齐，排除超时干扰。
+        timeout: 120s
         options:
           model: qwen3.8-27b
           temperature: 0.7
