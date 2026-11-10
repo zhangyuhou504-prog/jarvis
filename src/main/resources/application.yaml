@@ -23,3 +23,5 @@ jarvis:
     # 流式：相邻两个原始 SSE 事件之间的最大等待秒数，超时则中断并优雅收尾。
     # 关闭思考后首 chunk 约 2s，120s 仅作真正挂起的兜底。
     stream-element-timeout-seconds: 120
+    # 多轮对话：每次请求携带的历史消息条数上限（user/assistant 各算一条），超出取最近 N 条
+    max-history-messages: 20

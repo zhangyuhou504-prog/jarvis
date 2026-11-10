@@ -41,7 +41,7 @@ public class PromptTemplateService {
 
     /**
      * 模板注册表：模板标识 → 模板文件 + 预设变量。
-     *
+     * 这里后续可以拓展成为一个 Prompt 模板注册中心
      * <p>新增模板时在此登记：模板文件放 {@code classpath:prompts/}，
      * 预设变量需覆盖模板声明的全部 {@code ${var}} 占位符。</p>
      */

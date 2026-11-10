@@ -1,5 +1,7 @@
 package com.example.jarvis.service;
 
+import com.example.jarvis.domain.ChatMessage;
+import com.example.jarvis.domain.Conversation;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
@@ -17,6 +19,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,6 +40,7 @@ public class ChatService {
     private final ChatClient chatClient;
     private final WebClient gatewayWebClient;
     private final PromptTemplateService promptTemplateService;
+    private final ConversationService conversationService;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -63,6 +67,13 @@ public class ChatService {
      */
     @Value("${jarvis.chat.enable-thinking:false}")
     private boolean enableThinking;
+
+    /**
+     * 多轮对话携带的历史消息条数上限（user/assistant 各算一条）。
+     * 防止长会话把 token 打爆；超出时只取最近 N 条。
+     */
+    @Value("${jarvis.chat.max-history-messages:20}")
+    private int maxHistoryMessages;
 
     /**
      * 处理一轮对话，返回模型回答（非流式）。
@@ -101,14 +112,21 @@ public class ChatService {
      * @return 文本分片流，每个元素为模型生成的一小段文本
      */
     public Flux<String> chatStream(ChatRequest request) {
-        log.info("收到流式对话请求: {}", request.getMessage());
-        // 任务2：旁路收集完整答案。Reactor 对同一订阅的 onNext 串行回调，StringBuilder 无需加锁。
-        // 这是将来接 Memory/DB 落库的位置。
+        log.info("收到流式对话请求: conversationId={}, message={}",
+                request.getConversationId(), request.getMessage());
+        // 旁路收集完整答案。Reactor 对同一订阅的 onNext 串行回调，StringBuilder 无需加锁。
         StringBuilder fullAnswer = new StringBuilder();
-        // 任务1：标记是否发生过异常，便于 doFinally 区分结束原因。
+        // 标记是否发生过异常，流成功完成后才把本轮问答写入会话（失败/断连不留悬空消息）。
         AtomicBoolean errored = new AtomicBoolean(false);
 
-        Map<String, Object> body = streamBody(request.getMessage(), resolveSystemPrompt(request));
+        // 多轮对话：加载会话历史（conversationId 为空则单轮对话，无历史）。
+        // 会话不存在时 getConversation 抛 NotFoundException，在流构建前抛出，正常返回 404。
+        Conversation conversation = (request.getConversationId() == null || request.getConversationId().isBlank())
+                ? null
+                : conversationService.getConversation(request.getConversationId());
+        List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
+
+        Map<String, Object> body = streamBody(history, request.getMessage(), resolveSystemPrompt(request));
 
         // 打印实际请求参数（仅调试用，序列化失败不影响主流程）
         try {
@@ -122,53 +140,110 @@ public class ChatService {
                 .bodyValue(body)
                 .retrieve()
                 .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
-                // 任务1：元素间超时——放在原始 SSE 事件级：网关只要还在发任何 chunk（含推理模型思考阶段的
+                // 元素间超时——放在原始 SSE 事件级：网关只要还在发任何 chunk（含推理模型思考阶段的
                 // reasoning chunk、空内容 chunk）就不算超时；只有网关真正静默超过该时长（连接挂起、生成中断）才中断。
                 // 注意：不能放在 filter 空内容之后，否则推理模型思考期（content 全为空）会被误判为无响应。
                 .timeout(Duration.ofSeconds(streamElementTimeoutSeconds))
+                .filter(Objects::nonNull)
                 .map(ServerSentEvent::data)
                 .doOnNext(data -> log.info("原始模型chunk: {}", data))
-                .filter(Objects::nonNull)
                 .map(this::extractContent)
                 .filter(content -> !content.isEmpty())
-                // 任务2：每个 chunk 旁路拼接到完整答案（实时推送与收集并行）
+                // 每个 chunk 旁路拼接到完整答案（实时推送与收集并行）
                 .doOnNext(fullAnswer::append)
-                // 任务1：识别流中异常（模型调用失败 / 生成中报错 / 超时）
+                // 识别流中异常（模型调用失败 / 生成中报错 / 超时）
                 .doOnError(err -> {
                     errored.set(true);
                     log.error("流式回答异常, 已收集长度={}: {}", fullAnswer.length(), err.getMessage(), err);
                 })
-                // 任务3：流中错误兜底——响应已提交无法改状态码，转为友好提示并优雅结束
+                // 流中错误兜底——响应已提交无法改状态码，转为友好提示并优雅结束
                 .onErrorResume(err -> Flux.just("[提示] 回答生成中断，请稍后重试"))
-                // 任务1：流正常收尾（含被 onErrorResume 恢复后的收尾）
-                .doOnComplete(() -> log.info("流式回答收尾, 完整答案长度={}, 内容={}",
-                        fullAnswer.length(), fullAnswer))
-                // 任务1：最终释放——onComplete / onError / cancel（客户端断连）都会走到这里。
+                // 流正常收尾（含被 onErrorResume 恢复后的收尾）
+                .doOnComplete(() -> {
+                    log.info("流式回答收尾, 完整答案长度={}, 内容={}", fullAnswer.length(), fullAnswer);
+                    // 仅在本轮成功完成时写入会话，保证历史里只有完整的问答对
+                    if (conversation != null && !errored.get()) {
+                        appendTurn(conversation, request.getMessage(), fullAnswer.toString());
+                    }
+                })
+                // 最终释放——onComplete / onError / cancel（客户端断连）都会走到这里。
                 // 客户端断连时 Reactor 的 cancel 向上传播、取消上游 WebClient 请求，不再做无谓后续工作。
                 .doFinally(signal -> log.info("流式结束, 信号={}, 是否异常={}, 已收集长度={}",
                         signal, errored.get(), fullAnswer.length()));
     }
 
     /**
+     * 读取会话历史快照（最多最近 {@link #maxHistoryMessages} 条）。
+     *
+     * <p>对会话对象加锁，保证与 {@link #appendTurn} 的追加互斥，
+     * 快照本身是独立副本，后续追加不影响已发出的请求。</p>
+     *
+     * @param conversation 会话
+     * @return 历史消息副本（按时间顺序）
+     */
+    private List<ChatMessage> snapshotHistory(Conversation conversation) {
+        synchronized (conversation) {
+            List<ChatMessage> all = conversation.getMessages();
+            int from = Math.max(0, all.size() - maxHistoryMessages);
+            return new ArrayList<>(all.subList(from, all.size()));
+        }
+    }
+
+    /**
+     * 把本轮问答（user + assistant）追加到会话历史。
+     *
+     * @param conversation 会话
+     * @param userMessage  本轮用户消息
+     * @param assistantAnswer 本轮模型完整回答
+     */
+    private void appendTurn(Conversation conversation, String userMessage, String assistantAnswer) {
+        synchronized (conversation) {
+            conversation.getMessages().add(new ChatMessage("user", userMessage));
+            conversation.getMessages().add(new ChatMessage("assistant", assistantAnswer));
+        }
+        log.info("会话[{}]追加本轮问答, 当前历史条数={}",
+                conversation.getConversationId(), conversation.getMessages().size());
+    }
+
+    /**
      * 构建流式请求体（OpenAI 兼容格式）。
      *
-     * @param message      用户消息
-     * @param systemPrompt 本轮系统提示词（默认或模板渲染结果）
+     * <p>messages 数组结构：{@code [system] + [历史 user/assistant...] + [当前 user]}。
+     * system 提示词每次动态拼接（不存会话），历史消息来自会话快照。</p>
+     *
+     * @param history      会话历史消息（可为空，单轮对话时为空）
+     * @param message      当前用户消息
+     * @param systemPrompt 本轮系统提示词（模板渲染结果）
      * @return 请求体
      */
-    private Map<String, Object> streamBody(String message, String systemPrompt) {
+    private Map<String, Object> streamBody(List<ChatMessage> history, String message, String systemPrompt) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
         body.put("stream", true);
         body.put("enable_thinking", enableThinking);
-        Map<String, String> systemMsg = new LinkedHashMap<>();
-        systemMsg.put("role", "system");
-        systemMsg.put("content", systemPrompt);
-        Map<String, String> userMsg = new LinkedHashMap<>();
-        userMsg.put("role", "user");
-        userMsg.put("content", message);
-        body.put("messages", List.of(systemMsg, userMsg));
+
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(messageOf("system", systemPrompt));
+        for (ChatMessage m : history) {
+            messages.add(messageOf(m.getRole(), m.getContent()));
+        }
+        messages.add(messageOf("user", message));
+        body.put("messages", messages);
         return body;
+    }
+
+    /**
+     * 构建单条消息。
+     *
+     * @param role    角色
+     * @param content 内容
+     * @return 消息 Map
+     */
+    private Map<String, String> messageOf(String role, String content) {
+        Map<String, String> msg = new LinkedHashMap<>();
+        msg.put("role", role);
+        msg.put("content", content);
+        return msg;
     }
 
     /**

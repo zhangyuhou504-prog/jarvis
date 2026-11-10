@@ -72,6 +72,17 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 资源不存在（如会话 ID 查不到）——返回 404。
+     */
+    @ExceptionHandler(NotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(NotFoundException e) {
+        log.warn("资源不存在: {}", e.getMessage());
+        Map<String, Object> body = new HashMap<>();
+        body.put("error", e.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
+    }
+
+    /**
      * 客户端在响应过程中断开连接（流式接口常见：用户关页面、curl 超时等）。
      *
      * <p>此时响应已提交、客户端已离开，无法也无需再写任何响应。

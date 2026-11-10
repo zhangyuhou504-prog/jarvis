@@ -25,4 +25,11 @@ public class ChatRequest {
      * 不传则使用默认模板。
      */
     private String template;
+
+    /**
+     * 可选：会话标识（由 {@code POST /jarvis/conversations} 创建）。
+     * 不传则为单轮对话（不携带历史）；传了则自动携带该会话的历史消息，
+     * 回答完成后本轮问答写入会话。
+     */
+    private String conversationId;
 }
