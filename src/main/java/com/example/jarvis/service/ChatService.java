@@ -1,11 +1,11 @@
 package com.example.jarvis.service;
 
-import com.example.jarvis.config.LlmProperties;
 import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.domain.Conversation;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
+import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
@@ -16,7 +16,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 
 import java.time.Duration;
@@ -30,8 +29,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * AI 对话业务：调用大模型生成回答。
  *
- * <p>非流式走 Spring AI {@link ChatClient}；流式走直连网关的 {@link WebClient}，
- * 自行解析 SSE，规避网关精简 chunk 与 Spring AI 2.0 SDK 严格校验不兼容的问题。</p>
+ * <p>非流式走 Spring AI {@link ChatClient}（暂未接入多平台）；
+ * 流式走 {@link LlmClientFactory} 按模型解析出的 WebClient 直连平台，
+ * 自行解析 SSE（各平台 chunk 格式可能有差异，当前只提取
+ * {@code choices[0].delta.content}，不做过度适配）。</p>
  */
 @Service
 @Slf4j
@@ -39,10 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ChatService {
 
     private final ChatClient chatClient;
-    private final WebClient gatewayWebClient;
+    private final LlmClientFactory llmClientFactory;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
-    private final LlmProperties llmProperties;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -50,9 +50,8 @@ public class ChatService {
     private static final JsonMapper JSON = new JsonMapper();
 
     /**
-     * 流式：相邻两个原始 SSE 事件（网关 chunk）之间的最大等待时间（秒）。
+     * 流式：相邻两个原始 SSE 事件（平台 chunk）之间的最大等待时间（秒）。
      * 覆盖"连接挂起"与"生成中断"两种长时间无响应场景。
-     * 注意：这是网关事件级超时，推理模型思考期间网关持续发 chunk，不会触发。
      */
     @Value("${jarvis.chat.stream-element-timeout-seconds:120}")
     private long streamElementTimeoutSeconds;
@@ -60,28 +59,13 @@ public class ChatService {
     /**
      * 是否启用模型思考（reasoning）阶段。
      *
-     * <p>默认 {@code false}：{@code qwen3.8-27b} 是推理模型，思考阶段网关有时整段缓冲、
-     * 长时间不推任何 chunk（已实测静默超 60s），会导致流式超时或前端长时间无反馈。
-     * 关闭思考后网关 2 秒内即开始推流，响应稳定。需要更强推理质量时再置为 {@code true}。</p>
+     * <p><b>注意：这是公司网关（mxbc）的特定扩展参数，不是所有 OpenAI 兼容平台都识别，
+     * 因此暂时不从全局请求体下发。</b>背景：公司网关的推理模型思考阶段有时整段缓冲、
+     * 长时间不推 chunk，{@code enable_thinking:false} 可规避。
+     * 下一步迁移为 {@code LlmProperties.Model} 的每模型可选配置，由具体模型决定是否传递。</p>
      */
     @Value("${jarvis.chat.enable-thinking:false}")
     private boolean enableThinking;
-
-    /**
-     * 解析默认模型的配置（模型名、所属连接）。
-     *
-     * <p>模型名与 {@code AiConfig} 中 {@code gatewayWebClient} 的连接必须同源，
-     * 否则会出现"往 SiliconFlow 发 mxbc 内部别名"这类跨平台模型名不匹配（400）。</p>
-     *
-     * @return 默认模型配置
-     */
-    private LlmProperties.Model defaultModel() {
-        LlmProperties.Model model = llmProperties.models().get(llmProperties.defaultModel());
-        if (model == null) {
-            throw new IllegalStateException("默认模型不存在: " + llmProperties.defaultModel());
-        }
-        return model;
-    }
 
     /**
      * 多轮对话携带的历史消息条数上限（user/assistant 各算一条）。
@@ -92,6 +76,9 @@ public class ChatService {
 
     /**
      * 处理一轮对话，返回模型回答（非流式）。
+     *
+     * <p>注意：本方法仍走 Spring AI 自动装配的 {@link ChatClient}（公司网关），
+     * 尚未接入多平台；等流式多平台验证通过后再决定是否统一。</p>
      *
      * @param request 对话请求
      * @return 包含模型回答的响应
@@ -116,7 +103,8 @@ public class ChatService {
     /**
      * 流式对话：以响应式流逐段返回模型生成的文本。
      *
-     * <p>直接请求网关 {@code /chat/completions}（{@code stream=true}），
+     * <p>通过 {@link LlmClientFactory} 解析本次使用的模型客户端
+     * （当前先使用默认模型，后续由 ModelRouter 自动决定），
      * 逐条解析 SSE 数据中的 {@code choices[0].delta.content}。</p>
      *
      * <p>生命周期：{@code doOnNext} 旁路收集完整答案；{@code timeout} 控制元素间超时；
@@ -141,22 +129,27 @@ public class ChatService {
                 : conversationService.getConversation(request.getConversationId());
         List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
 
-        Map<String, Object> body = streamBody(history, request.getMessage(), resolveSystemPrompt(request));
+        // 当前先使用默认模型，后续由 ModelRouter 自动决定
+        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(null);
+        log.info("本次流式使用模型: modelId={}, modelName={}, baseUrl={}",
+                client.modelId(), client.modelName(), client.baseUrl());
 
-        // 打印实际请求参数（仅调试用，序列化失败不影响主流程）
+        Map<String, Object> body = streamBody(history, request.getMessage(), resolveSystemPrompt(request), client);
+
+        // 打印实际请求参数（DEBUG 级，避免生产环境泄露对话内容；序列化失败不影响主流程）
         try {
-            log.info("模型请求参数: {}", JSON.writeValueAsString(body));
+            log.debug("模型请求参数: {}", JSON.writeValueAsString(body));
         } catch (JsonProcessingException e) {
             log.warn("请求参数序列化失败: {}", e.getMessage());
         }
 
-        return gatewayWebClient.post()
+        return client.webClient().post()
                 .uri("/chat/completions")
                 .bodyValue(body)
                 .retrieve()
                 .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
-                // 元素间超时——放在原始 SSE 事件级：网关只要还在发任何 chunk（含推理模型思考阶段的
-                // reasoning chunk、空内容 chunk）就不算超时；只有网关真正静默超过该时长（连接挂起、生成中断）才中断。
+                // 元素间超时——放在原始 SSE 事件级：平台只要还在发任何 chunk（含推理模型思考阶段的
+                // reasoning chunk、空内容 chunk）就不算超时；只有平台真正静默超过该时长（连接挂起、生成中断）才中断。
                 // 注意：不能放在 filter 空内容之后，否则推理模型思考期（content 全为空）会被误判为无响应。
                 .timeout(Duration.ofSeconds(streamElementTimeoutSeconds))
                 .filter(Objects::nonNull)
@@ -207,8 +200,8 @@ public class ChatService {
     /**
      * 把本轮问答（user + assistant）追加到会话历史。
      *
-     * @param conversation 会话
-     * @param userMessage  本轮用户消息
+     * @param conversation    会话
+     * @param userMessage     本轮用户消息
      * @param assistantAnswer 本轮模型完整回答
      */
     private void appendTurn(Conversation conversation, String userMessage, String assistantAnswer) {
@@ -226,16 +219,31 @@ public class ChatService {
      * <p>messages 数组结构：{@code [system] + [历史 user/assistant...] + [当前 user]}。
      * system 提示词每次动态拼接（不存会话），历史消息来自会话快照。</p>
      *
+     * <p>{@code temperature}/{@code max_tokens} 为可选参数，模型未配置时不传，
+     * 让平台使用默认值。平台扩展参数（如公司网关的 {@code enable_thinking}）
+     * 不在此全局下发，待迁移到每模型配置后按模型传递。</p>
+     *
      * @param history      会话历史消息（可为空，单轮对话时为空）
      * @param message      当前用户消息
      * @param systemPrompt 本轮系统提示词（模板渲染结果）
+     * @param client       本次使用的模型客户端
      * @return 请求体
      */
-    private Map<String, Object> streamBody(List<ChatMessage> history, String message, String systemPrompt) {
+    private Map<String, Object> streamBody(List<ChatMessage> history, String message, String systemPrompt,
+                                           LlmClientFactory.ResolvedLlmClient client) {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", defaultModel().modelName());
+
+        // 使用本次选中的平台模型名称
+        body.put("model", client.modelName());
         body.put("stream", true);
-        body.put("enable_thinking", enableThinking);
+
+        // 可选参数：没有配置时不传，让平台使用默认值
+        if (client.temperature() != null) {
+            body.put("temperature", client.temperature());
+        }
+        if (client.maxTokens() != null) {
+            body.put("max_tokens", client.maxTokens());
+        }
 
         List<Map<String, String>> messages = new ArrayList<>();
         messages.add(messageOf("system", systemPrompt));
@@ -276,8 +284,8 @@ public class ChatService {
                 ? PromptTemplateService.DEFAULT_TEMPLATE
                 : request.getTemplate();
         String prompt = promptTemplateService.render(templateName);
-        // 打印最终生成的 Prompt，便于确认模板选择与变量填充正确
-        log.info("模板[{}]渲染后的系统提示词: {}", templateName, prompt);
+        // 打印最终生成的 Prompt（DEBUG 级，避免生产环境泄露对话内容）
+        log.debug("模板[{}]渲染后的系统提示词: {}", templateName, prompt);
         return prompt;
     }
 
@@ -285,7 +293,9 @@ public class ChatService {
      * 从一条 SSE 数据中提取文本内容。
      *
      * <p>兼容网关两种 chunk 格式：标准 chunk 与精简 chunk
-     * （后者不带 {@code id} 等字段，只有 {@code choices[0].delta.content}）。</p>
+     * （后者不带 {@code id} 等字段，只有 {@code choices[0].delta.content}）。
+     * 不同平台的 chunk 格式可能有差异（元数据、reasoning_content、结束标志、[DONE]），
+     * 当前只提取正文，不提前做平台适配。</p>
      *
      * @param data SSE 事件数据（JSON 字符串，或 {@code [DONE]}）
      * @return 文本内容；非文本事件返回空串
