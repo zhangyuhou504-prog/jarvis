@@ -27,6 +27,12 @@ public class ChatRequest {
     private String template;
 
     /**
+     * 可选：模型 ID（对应 {@code jarvis.llm.models} 的 key，如 {@code mxbc-qwen}）。
+     * 不传则使用默认模型（{@code jarvis.llm.default-model}）。
+     */
+    private String modelId;
+
+    /**
      * 可选：会话标识（由 {@code POST /jarvis/conversations} 创建）。
      * 不传则为单轮对话（不携带历史）；传了则自动携带该会话的历史消息，
      * 回答完成后本轮问答写入会话。

@@ -6,6 +6,7 @@ import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
+import com.example.jarvis.router.ModelRouter;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
@@ -41,6 +42,7 @@ public class ChatService {
 
     private final ChatClient chatClient;
     private final LlmClientFactory llmClientFactory;
+    private final ModelRouter modelRouter;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
 
@@ -55,17 +57,6 @@ public class ChatService {
      */
     @Value("${jarvis.chat.stream-element-timeout-seconds:120}")
     private long streamElementTimeoutSeconds;
-
-    /**
-     * 是否启用模型思考（reasoning）阶段。
-     *
-     * <p><b>注意：这是公司网关（mxbc）的特定扩展参数，不是所有 OpenAI 兼容平台都识别，
-     * 因此暂时不从全局请求体下发。</b>背景：公司网关的推理模型思考阶段有时整段缓冲、
-     * 长时间不推 chunk，{@code enable_thinking:false} 可规避。
-     * 下一步迁移为 {@code LlmProperties.Model} 的每模型可选配置，由具体模型决定是否传递。</p>
-     */
-    @Value("${jarvis.chat.enable-thinking:false}")
-    private boolean enableThinking;
 
     /**
      * 多轮对话携带的历史消息条数上限（user/assistant 各算一条）。
@@ -103,8 +94,8 @@ public class ChatService {
     /**
      * 流式对话：以响应式流逐段返回模型生成的文本。
      *
-     * <p>通过 {@link LlmClientFactory} 解析本次使用的模型客户端
-     * （当前先使用默认模型，后续由 ModelRouter 自动决定），
+     * <p>模型选择由 {@link ModelRouter} 决定（指定 modelId 优先 → 模板映射 → 默认模型），
+     * 再经 {@link LlmClientFactory} 解析出平台客户端；
      * 逐条解析 SSE 数据中的 {@code choices[0].delta.content}。</p>
      *
      * <p>生命周期：{@code doOnNext} 旁路收集完整答案；{@code timeout} 控制元素间超时；
@@ -129,8 +120,9 @@ public class ChatService {
                 : conversationService.getConversation(request.getConversationId());
         List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
 
-        // 当前先使用默认模型，后续由 ModelRouter 自动决定
-        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(null);
+        // 路由决定模型 ID，工厂解析平台客户端（模型不存在时工厂抛 IllegalArgumentException，
+        // 在流构建前抛出，正常返回 400）
+        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request));
         log.info("本次流式使用模型: modelId={}, modelName={}, baseUrl={}",
                 client.modelId(), client.modelName(), client.baseUrl());
 
@@ -219,9 +211,10 @@ public class ChatService {
      * <p>messages 数组结构：{@code [system] + [历史 user/assistant...] + [当前 user]}。
      * system 提示词每次动态拼接（不存会话），历史消息来自会话快照。</p>
      *
-     * <p>{@code temperature}/{@code max_tokens} 为可选参数，模型未配置时不传，
-     * 让平台使用默认值。平台扩展参数（如公司网关的 {@code enable_thinking}）
-     * 不在此全局下发，待迁移到每模型配置后按模型传递。</p>
+     * <p>{@code temperature}/{@code max_tokens}/{@code enable_thinking} 均为可选参数，
+     * 模型未配置时不传，让平台使用默认值。{@code enable_thinking} 是平台扩展参数
+     * （公司网关特有，用于规避推理模型思考阶段整段缓冲），按每模型配置决定是否下发，
+     * 不能假设所有平台都识别。</p>
      *
      * @param history      会话历史消息（可为空，单轮对话时为空）
      * @param message      当前用户消息
@@ -243,6 +236,11 @@ public class ChatService {
         }
         if (client.maxTokens() != null) {
             body.put("max_tokens", client.maxTokens());
+        }
+        // 平台扩展参数：仅当模型显式配置时才下发（公司网关的 enable_thinking，
+        // 其他 OpenAI 兼容平台未必识别，未配置的模型不传）
+        if (client.enableThinking() != null) {
+            body.put("enable_thinking", client.enableThinking());
         }
 
         List<Map<String, String>> messages = new ArrayList<>();

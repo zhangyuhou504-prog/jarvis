@@ -74,6 +74,7 @@ public class LlmClientFactory {
                 model.modelName(),
                 model.temperature(),
                 model.maxTokens(),
+                model.enableThinking(),
                 connection.baseUrl(),
                 webClient
         );
@@ -100,18 +101,20 @@ public class LlmClientFactory {
     /**
      * 已解析完成的模型客户端信息。
      *
-     * @param modelId     模型 ID
-     * @param modelName   平台侧模型名（放入请求体 model 字段）
-     * @param temperature 温度（可为 null，走平台默认）
-     * @param maxTokens   最大生成 token 数（可为 null，走平台默认）
-     * @param baseUrl     平台地址（便于排查/展示，WebClient 本身不暴露它）
-     * @param webClient   对应平台的 WebClient
+     * @param modelId        模型 ID
+     * @param modelName      平台侧模型名（放入请求体 model 字段）
+     * @param temperature    温度（可为 null，走平台默认）
+     * @param maxTokens      最大生成 token 数（可为 null，走平台默认）
+     * @param enableThinking 是否启用思考阶段（平台扩展参数，可为 null = 不下发）
+     * @param baseUrl        平台地址（便于排查/展示，WebClient 本身不暴露它）
+     * @param webClient      对应平台的 WebClient
      */
     public record ResolvedLlmClient(
             String modelId,
             String modelName,
             Double temperature,
             Integer maxTokens,
+            Boolean enableThinking,
             String baseUrl,
             WebClient webClient
     ) {

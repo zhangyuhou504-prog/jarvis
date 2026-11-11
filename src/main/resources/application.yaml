@@ -21,6 +21,11 @@ jarvis:
     # 默认模型（WebClient 模型调用层使用）
     default-model: mxbc-qwen
 
+    # 模板 → 模型的路由映射（ModelRouter 第一版确定性规则）：
+    # 不指定 modelId 时使用某模板，则路由到映射的模型；模板未配置映射时回落默认模型。
+    template-models:
+      sql-analysis: gjld-qwen
+
     connections:
       # 硅基流动
       gjld:
@@ -41,14 +46,12 @@ jarvis:
         model-name: qwen3.8-27b
         temperature: 0.7
         max-tokens: 4096
+        # 公司网关特定扩展参数：关闭思考阶段，规避其推理模型思考期整段缓冲导致的流式超时。
+        # 平台扩展参数按模型配置，其他平台（如 gjld）不配即不下发。
+        enable-thinking: false
 
   chat:
-    # 是否启用模型思考（reasoning）阶段。
-    # 默认 false：qwen3.8-27b 思考阶段网关有时整段缓冲、长时间不推 chunk，会导致流式超时；
-    # 关闭后 2 秒内即开始推流，响应稳定。需要更强推理质量时改为 true。
-    enable-thinking: false
-    # 流式：相邻两个原始 SSE 事件之间的最大等待秒数，超时则中断并优雅收尾。
-    # 关闭思考后首 chunk 约 2s，120s 仅作真正挂起的兜底。
+    # 流式：相邻两个原始 SSE 事件之间的最大等待秒数，超时则中断并优雅收尾
     stream-element-timeout-seconds: 120
     # 多轮对话：每次请求携带的历史消息条数上限（user/assistant 各算一条），超出取最近 N 条
     max-history-messages: 20
