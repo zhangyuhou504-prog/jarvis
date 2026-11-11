@@ -55,3 +55,11 @@ jarvis:
     stream-element-timeout-seconds: 120
     # 多轮对话：每次请求携带的历史消息条数上限（user/assistant 各算一条），超出取最近 N 条
     max-history-messages: 20
+
+  # 意图识别专用配置：分类输出很短，应指向更快/更稳定的模型，与主对话模型解耦。
+  intent:
+    # 意图识别使用的模型 ID（对应 jarvis.llm.models 的 key）；空则用 default-model。
+    # 用 gjld-qwen（硅基流动，实测响应快且实时），避免默认 mxbc-qwen 非流式超时。
+    model-id: mxbc-qwen
+    # 意图识别的模型调用超时（秒）。分类输出短，正常几秒内完成。
+    timeout-seconds: 60
