@@ -13,6 +13,7 @@ import java.util.Map;
  *   <li>{@code models}：模型信息，模型名 + 所属连接 + 默认参数</li>
  *   <li>{@code defaultModel}：默认使用哪个模型配置</li>
  *   <li>{@code templateModels}：模板标识 → 模型 ID 的确定性路由映射（第一版 ModelRouter 规则）</li>
+ *   <li>{@code intentModels}：意图标识 → 模型 ID 的路由映射（第五阶段意图识别后新增）</li>
  * </ul>
  *
  * <p>新增平台只需在 yaml 里加一个 connection + model，无需改代码。</p>
@@ -22,7 +23,8 @@ public record LlmProperties(
         String defaultModel,
         Map<String, Connection> connections,
         Map<String, Model> models,
-        Map<String, String> templateModels
+        Map<String, String> templateModels,
+        Map<String, String> intentModels
 ) {
 
     /**

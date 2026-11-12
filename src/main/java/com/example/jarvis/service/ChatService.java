@@ -6,6 +6,7 @@ import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.exception.AiServiceException;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
+import com.example.jarvis.model.IntentResult;
 import com.example.jarvis.router.ModelRouter;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -43,6 +44,7 @@ public class ChatService {
     private final ChatClient chatClient;
     private final LlmClientFactory llmClientFactory;
     private final ModelRouter modelRouter;
+    private final IntentService intentService;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
 
@@ -50,6 +52,13 @@ public class ChatService {
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
      */
     private static final JsonMapper JSON = new JsonMapper();
+
+    /**
+     * 是否启用意图识别参与模型路由。
+     * 关闭后跳过分类调用（不增加首 token 延迟），路由退化为"指定 modelId → 模板映射 → 默认模型"。
+     */
+    @Value("${jarvis.intent.enabled:true}")
+    private boolean intentEnabled;
 
     /**
      * 流式：相邻两个原始 SSE 事件（平台 chunk）之间的最大等待时间（秒）。
@@ -94,8 +103,12 @@ public class ChatService {
     /**
      * 流式对话：以响应式流逐段返回模型生成的文本。
      *
-     * <p>模型选择由 {@link ModelRouter} 决定（指定 modelId 优先 → 模板映射 → 默认模型），
-     * 再经 {@link LlmClientFactory} 解析出平台客户端；
+     * <p>模型选择由 {@link ModelRouter} 决定（指定 modelId 优先 → 模板映射 → 意图映射 → 默认模型）。
+     * 启用意图识别（{@code jarvis.intent.enabled}，默认开）时，路由前先经 {@link IntentService}
+     * 同步分类一次，把 {@link IntentResult} 交给路由器；分类失败回落 UNKNOWN，不阻断主链路
+     * （代价：首 token 延迟增加一次分类调用的耗时）。</p>
+     *
+     * <p>再经 {@link LlmClientFactory} 解析出平台客户端；
      * 逐条解析 SSE 数据中的 {@code choices[0].delta.content}。</p>
      *
      * <p>生命周期：{@code doOnNext} 旁路收集完整答案；{@code timeout} 控制元素间超时；
@@ -120,9 +133,18 @@ public class ChatService {
                 : conversationService.getConversation(request.getConversationId());
         List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
 
+        // 意图识别：路由前同步分类一次（启用时）。IntentService 保证不抛异常、不返回 null，
+        // 分类失败回落 UNKNOWN，由 ModelRouter 决定回落默认模型，主链路不受影响。
+        IntentResult intent = null;
+        if (intentEnabled) {
+            intent = intentService.recognize(request.getMessage());
+            log.info("意图识别结果: intent={}, confidence={}, reason={}",
+                    intent.intent(), intent.confidence(), intent.reason());
+        }
+
         // 路由决定模型 ID，工厂解析平台客户端（模型不存在时工厂抛 IllegalArgumentException，
         // 在流构建前抛出，正常返回 400）
-        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request));
+        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request, intent));
         log.info("本次流式使用模型: modelId={}, modelName={}, baseUrl={}",
                 client.modelId(), client.modelName(), client.baseUrl());
 

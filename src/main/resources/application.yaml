@@ -26,6 +26,16 @@ jarvis:
     template-models:
       sql-analysis: gjld-qwen
 
+    # 意图 → 模型的路由映射（第五阶段：意图识别参与路由）：
+    # 用户未指定 modelId、模板也未映射时，按 IntentService 识别出的意图选模型。
+    # 意图标识为 IntentType 枚举名；UNKNOWN 不参与路由（识别失败回落默认模型）。
+    # 未配置某意图时同样回落默认模型。后续接入更多模型后可按意图细分。
+    intent-models:
+      SQL_ANALYSIS: mxbc-qwen
+      TROUBLESHOOTING: mxbc-qwen
+      DATA_QUERY: mxbc-qwen
+      # GENERAL_QA 不配置 → 走默认模型 mxbc-qwen
+
     connections:
       # 硅基流动
       gjld:
@@ -58,6 +68,9 @@ jarvis:
 
   # 意图识别专用配置：分类输出很短，应指向更快/更稳定的模型，与主对话模型解耦。
   intent:
+    # 是否启用意图识别参与模型路由（ChatService 流式链路）。
+    # 关闭后跳过分类调用（不增加首 token 延迟），路由退化为"指定 modelId → 模板映射 → 默认模型"。
+    enabled: true
     # 意图识别使用的模型 ID（对应 jarvis.llm.models 的 key）；空则用 default-model。
     # 用 gjld-qwen（硅基流动，实测响应快且实时），避免默认 mxbc-qwen 非流式超时。
     model-id: mxbc-qwen
