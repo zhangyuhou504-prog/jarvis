@@ -3,6 +3,7 @@ package com.example.jarvis.service;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.infrastructure.llm.LlmClientService;
 import com.example.jarvis.tool.ToolExecutor;
+import com.example.jarvis.tool.ToolRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -41,6 +42,7 @@ public class ToolLoopService {
 
     private final LlmClientService llmClientService;
     private final ToolExecutor toolExecutor;
+    private final ToolRegistry toolRegistry;
 
     /**
      * 单次对话最多执行的工具调用轮数。
@@ -54,16 +56,18 @@ public class ToolLoopService {
     @Value("${jarvis.tool.call-timeout-seconds:120}")
     private long callTimeoutSeconds;
 
-    public ToolLoopService(LlmClientService llmClientService, ToolExecutor toolExecutor) {
+    public ToolLoopService(LlmClientService llmClientService, ToolExecutor toolExecutor,
+                           ToolRegistry toolRegistry) {
         this.llmClientService = llmClientService;
         this.toolExecutor = toolExecutor;
+        this.toolRegistry = toolRegistry;
     }
 
     /**
      * 执行工具调用闭环，返回模型最终文本答案。
      *
-     * <p>工具定义（{@code tools} 字段）由本服务内置维护，与 {@link ToolExecutor}
-     * 的白名单保持一致——模型只能调用这里声明过的工具。</p>
+     * <p>工具定义（{@code tools} 字段）来自 {@link ToolRegistry}，与 {@link ToolExecutor}
+     * 的执行白名单是同一份注册表——模型只能调用注册过的工具。</p>
      *
      * @param client   已解析的模型客户端
      * @param messages 初始消息数组（system + 历史 + 当前 user），方法内部会拷贝，不修改入参
@@ -145,64 +149,8 @@ public class ToolLoopService {
             body.put("enable_thinking", client.enableThinking());
         }
         body.set("messages", messages);
-        body.set("tools", TOOL_DEFINITIONS);
+        // 工具定义统一来自注册表（与执行白名单同源）
+        body.set("tools", toolRegistry.definitions());
         return body;
-    }
-
-    /**
-     * 内置工具定义（JSON Schema）。必须与 {@link ToolExecutor} 的白名单一致：
-     * 声明了但执行器不支持的工具，模型调用时会收到"不支持的工具"回传。
-     */
-    private static final ArrayNode TOOL_DEFINITIONS = buildToolDefinitions();
-
-    private static ArrayNode buildToolDefinitions() {
-        ArrayNode tools = JSON.createArrayNode();
-
-        ObjectNode multiply = JSON.createObjectNode();
-        multiply.put("type", "function");
-        ObjectNode function = JSON.createObjectNode();
-        function.put("name", "multiply");
-        function.put("description", "计算两个整数的乘积。当用户要求做乘法、两个数相乘时使用。");
-        ObjectNode parameters = JSON.createObjectNode();
-        parameters.put("type", "object");
-        ObjectNode properties = JSON.createObjectNode();
-        ObjectNode a = JSON.createObjectNode();
-        a.put("type", "integer");
-        a.put("description", "第一个乘数");
-        properties.set("a", a);
-        ObjectNode b = JSON.createObjectNode();
-        b.put("type", "integer");
-        b.put("description", "第二个乘数");
-        properties.set("b", b);
-        parameters.set("properties", properties);
-        ArrayNode required = JSON.createArrayNode();
-        required.add("a");
-        required.add("b");
-        parameters.set("required", required);
-        function.set("parameters", parameters);
-        multiply.set("function", function);
-        tools.add(multiply);
-
-        // getCurrentTime：获取指定时区的当前时间（timezone 非必填，缺失时后端用默认时区）
-        ObjectNode currentTime = JSON.createObjectNode();
-        currentTime.put("type", "function");
-        ObjectNode timeFunction = JSON.createObjectNode();
-        timeFunction.put("name", "getCurrentTime");
-        timeFunction.put("description", "获取指定时区的当前时间。当用户询问现在几点、某地当前时间时使用。");
-        ObjectNode timeParameters = JSON.createObjectNode();
-        timeParameters.put("type", "object");
-        ObjectNode timeProperties = JSON.createObjectNode();
-        ObjectNode timezone = JSON.createObjectNode();
-        timezone.put("type", "string");
-        timezone.put("description", "IANA 时区，例如 Asia/Shanghai、America/New_York。不传则使用默认时区");
-        timeProperties.set("timezone", timezone);
-        timeParameters.set("properties", timeProperties);
-        timeParameters.set("required", JSON.createArrayNode());
-        timeParameters.put("additionalProperties", false);
-        timeFunction.set("parameters", timeParameters);
-        currentTime.set("function", timeFunction);
-        tools.add(currentTime);
-
-        return tools;
     }
 }

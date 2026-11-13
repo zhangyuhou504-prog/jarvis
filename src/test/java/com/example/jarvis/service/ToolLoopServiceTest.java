@@ -5,6 +5,7 @@ import com.example.jarvis.infrastructure.llm.LlmClientService;
 import com.example.jarvis.tool.CurrentTimeTool;
 import com.example.jarvis.tool.MultiplyTool;
 import com.example.jarvis.tool.ToolExecutor;
+import com.example.jarvis.tool.ToolRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -42,8 +43,9 @@ class ToolLoopServiceTest {
         llmClientService = mock(LlmClientService.class);
         CurrentTimeTool currentTimeTool = new CurrentTimeTool();
         ReflectionTestUtils.setField(currentTimeTool, "defaultTimezone", "Asia/Shanghai");
-        ToolExecutor toolExecutor = new ToolExecutor(new MultiplyTool(), currentTimeTool, new JsonMapper());
-        toolLoopService = new ToolLoopService(llmClientService, toolExecutor);
+        ToolRegistry registry = new ToolRegistry(java.util.List.of(new MultiplyTool(), currentTimeTool));
+        ToolExecutor toolExecutor = new ToolExecutor(registry, new JsonMapper());
+        toolLoopService = new ToolLoopService(llmClientService, toolExecutor, registry);
         ReflectionTestUtils.setField(toolLoopService, "maxRounds", 5);
         ReflectionTestUtils.setField(toolLoopService, "callTimeoutSeconds", 30L);
 
