@@ -49,4 +49,18 @@ public class ChatController {
     public Flux<String> chatStream(@Valid @RequestBody ChatRequest request) throws JsonProcessingException {
         return chatService.chatStream(request);
     }
+
+    /**
+     * 工具对话接口（非流式，支持 Tool Calling）。
+     *
+     * <p>POST /jarvis/chat/tools。模型可调用后端 Java 工具（如 multiply），
+     * 多轮执行工具直到给出最终答案，一次性返回完整结果。</p>
+     *
+     * @param request 对话请求
+     * @return 模型最终答案
+     */
+    @PostMapping("/chat/tools")
+    public ChatResponse chatWithTools(@Valid @RequestBody ChatRequest request) {
+        return chatService.chatWithTools(request);
+    }
 }

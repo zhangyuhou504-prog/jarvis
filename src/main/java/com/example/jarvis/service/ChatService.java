@@ -19,6 +19,8 @@ import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.ObjectNode;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -45,6 +47,7 @@ public class ChatService {
     private final LlmClientFactory llmClientFactory;
     private final ModelRouter modelRouter;
     private final IntentService intentService;
+    private final ToolLoopService toolLoopService;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
 
@@ -52,6 +55,11 @@ public class ChatService {
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
      */
     private static final JsonMapper JSON = new JsonMapper();
+
+    /**
+     * Jackson 3 解析器（仅用于构建工具对话的消息数组，与 tools.jackson 包一致）。
+     */
+    private static final tools.jackson.databind.json.JsonMapper JSON3 = new tools.jackson.databind.json.JsonMapper();
 
     /**
      * 是否启用意图识别参与模型路由。
@@ -192,6 +200,77 @@ public class ChatService {
                 // 客户端断连时 Reactor 的 cancel 向上传播、取消上游 WebClient 请求，不再做无谓后续工作。
                 .doFinally(signal -> log.info("流式结束, 信号={}, 是否异常={}, 已收集长度={}",
                         signal, errored.get(), fullAnswer.length()));
+    }
+
+    /**
+     * 工具对话（非流式）：意图识别 → 模型路由 → 工具调用闭环 → 返回最终答案。
+     *
+     * <p>与 {@link #chatStream} 的区别：本方法走 {@link ToolLoopService} 的非流式工具闭环
+     * （模型可调用 multiply 等 Java 工具，多轮执行直到给出最终答案），
+     * 客户端拿到的是完整答案而非文本流。已验收的 SSE 流式链路不受影响。</p>
+     *
+     * <p>模型选择规则与流式一致：指定 modelId 优先 → 模板映射 → 意图映射 → 默认模型。</p>
+     *
+     * @param request 对话请求
+     * @return 包含模型最终答案的响应
+     */
+    public ChatResponse chatWithTools(ChatRequest request) {
+        log.info("收到工具对话请求: conversationId={}, message={}",
+                request.getConversationId(), request.getMessage());
+
+        // 意图识别 + 模型路由（与流式链路同一套规则）
+        IntentResult intent = null;
+        if (intentEnabled) {
+            intent = intentService.recognize(request.getMessage());
+            log.info("意图识别结果: intent={}, confidence={}, reason={}",
+                    intent.intent(), intent.confidence(), intent.reason());
+        }
+        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request, intent));
+        log.info("本次工具对话使用模型: modelId={}, modelName={}, baseUrl={}",
+                client.modelId(), client.modelName(), client.baseUrl());
+
+        // 组装上下文：system + 会话历史 + 当前 user
+        Conversation conversation = (request.getConversationId() == null || request.getConversationId().isBlank())
+                ? null
+                : conversationService.getConversation(request.getConversationId());
+        List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
+
+        ArrayNode messages = buildMessages(resolveSystemPrompt(request), history, request.getMessage());
+
+        // 工具闭环（内部多轮非流式调用，直到模型给出最终答案）
+        String answer = toolLoopService.run(client, messages);
+        log.info("工具对话完成, 答案长度={}", answer.length());
+
+        // 成功完成时写入会话（与流式链路一致：只保存完整问答对）
+        if (conversation != null) {
+            appendTurn(conversation, request.getMessage(), answer);
+        }
+        return new ChatResponse(answer);
+    }
+
+    /**
+     * 组装 OpenAI 兼容的 messages 数组：{@code [system] + [历史 user/assistant...] + [当前 user]}。
+     *
+     * @param systemPrompt 系统提示词
+     * @param history      会话历史
+     * @param message      当前用户消息
+     * @return messages 数组
+     */
+    private ArrayNode buildMessages(String systemPrompt, List<ChatMessage> history, String message) {
+        ArrayNode messages = JSON3.createArrayNode();
+        messages.add(messageOf3("system", systemPrompt));
+        for (ChatMessage m : history) {
+            messages.add(messageOf3(m.getRole(), m.getContent()));
+        }
+        messages.add(messageOf3("user", message));
+        return messages;
+    }
+
+    private ObjectNode messageOf3(String role, String content) {
+        ObjectNode msg = JSON3.createObjectNode();
+        msg.put("role", role);
+        msg.put("content", content);
+        return msg;
     }
 
     /**

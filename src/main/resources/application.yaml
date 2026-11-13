@@ -76,3 +76,12 @@ jarvis:
     model-id: mxbc-qwen
     # 意图识别的模型调用超时（秒）。分类输出短，正常几秒内完成。
     timeout-seconds: 60
+
+  # 工具调用（Tool Calling）配置
+  tool:
+    # 单次对话最多执行的工具调用轮数，防止模型陷入无限调用
+    max-rounds: 5
+    # 工具循环内单次非流式模型调用超时（秒）
+    call-timeout-seconds: 120
+    # getCurrentTime 工具：用户未指定时区时使用的默认时区（IANA 格式）
+    default-timezone: Asia/Shanghai
