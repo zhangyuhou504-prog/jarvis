@@ -1,6 +1,7 @@
 package com.example.jarvis.plan;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -37,8 +38,13 @@ import java.util.Queue;
  * <p><b>前置条件</b>：入参 Plan 必须已通过 {@link PlanValidator} 校验
  * （stepId 唯一、依赖引用存在、无环）。环在调度层表现为"队列提前排空、
  * 结果不完整"，但语义校验应在上游拦截，本类不做重复校验。</p>
+ *
+ * <p><b>Spring 注册</b>：{@code @Component}——被
+ * {@code PlanOrchestrationService} 构造器注入；无状态、线程安全
+ * （topologicalSort 所有状态都在方法栈内）。</p>
  */
 @Slf4j
+@Component
 public class PlanScheduler {
 
     /**
