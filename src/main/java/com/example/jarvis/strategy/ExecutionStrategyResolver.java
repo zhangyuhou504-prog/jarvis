@@ -21,16 +21,19 @@ import java.util.regex.Pattern;
  *
  * <p><b>当前规则集（第一版，按判断顺序）</p>
  * <ol>
- *   <li>意图为 GENERAL_QA（普通知识问答）→ DIRECT：<b>短路最前</b>。
- *       普通问答不应因为句中出现"然后""再"等词就被误判进 Planner
- *       （如"Redis 和 MySQL 有什么区别？"）——意图信号优先于文本特征</li>
+ *   <li>意图为 GENERAL_QA 且<b>无任何多步文本特征</b> → DIRECT：
+ *       意图 + 文本特征联合短路。不能只看意图——实测"帮我计算 128 × 256，
+ *       然后把结果乘以 2"会被意图分类成 GENERAL_QA（意图体系无计算类目），
+ *       只凭意图短路会放行真正的多步任务</li>
  *   <li>消息中含任务连接词（"然后"、"再"、"接着" 等，正则匹配）→ PLANNED：
  *       连接词暗示多个子任务存在顺序/依赖关系</li>
- *   <li>消息含分隔符特征（两个及以上分号，或两个及以上非空行）→ PLANNED：
+ *   <li>消息含分隔符特征（1 个及以上分号，或 2 个及以上非空行）→ PLANNED：
  *       用户把任务拆成几段列出来，是最强的复合任务信号</li>
  * </ol>
  *
- * <p>三条规则都不命中 → 返回 null（不明确），由外层走小模型兜底。</p>
+ * <p><b>GENERAL_QA + 有多步特征时</b>：不短路也不直接判 PLANNED——交给
+ * 小模型兜底终审（模型能区分"先介绍 Redis 再介绍 MySQL"的假多步与
+ * "先计算再把结果乘 2"的真多步，文本规则做不到这一层）。</p>
  */
 @Slf4j
 @Component
@@ -62,17 +65,23 @@ public class ExecutionStrategyResolver {
     public StrategyResult resolve(StrategyContext context) {
         String message = context.userMessage();
 
-        // 规则 0（短路最前）：意图为 GENERAL_QA → 普通知识问答，无需规划。
-        // 必须放在文本规则之前：普通问答不应因为句中出现"然后""再"等词
-        // 就被误判进 Planner（如"Redis 和 MySQL 有什么区别？"里没有连接词，
-        // 但"先说相同点，再说区别"这类句式有——意图信号优先于文本特征）
+        // 规则 0（意图 + 文本特征联合判断）：意图为 GENERAL_QA 且消息不含
+        // 任何多步文本特征 → 普通知识问答，短路 DIRECT。
+        // <p><b>为什么不能只看意图</b>（实测教训）：意图分类器会把"帮我计算
+        // 128 × 256，然后把结果乘以 2"识别成 GENERAL_QA（意图体系无"计算"类目，
+        // 模型只能就近归类）——若只凭意图短路，多步任务会被直接放行，连接词
+        // 规则根本没机会执行。意图只回答"是什么类型"，不回答"有几步"；
+        // 文本特征（连接词/分段）是低成本的多步信号，两者联合才可靠。</p>
+        // 有文本特征时不短路：交给下方规则或小模型终审（模型能区分
+        // "先介绍 Redis 再介绍 MySQL"（DIRECT）与"先计算再把结果乘 2"（PLANNED））
         IntentResult intentResult = context.intentResult();
-        if (intentResult != null && intentResult.intent() == IntentType.GENERAL_QA) {
-            log.info("策略规则命中[GENERAL_QA] → DIRECT: conversationId={}",
+        if (intentResult != null && intentResult.intent() == IntentType.GENERAL_QA
+                && !hasMultiStepTextFeature(message)) {
+            log.info("策略规则命中[GENERAL_QA 无多步特征] → DIRECT: conversationId={}",
                     context.conversationId());
             return new StrategyResult(
                     ExecutionStrategy.DIRECT,
-                    "意图为普通知识问答，无需任务规划");
+                    "意图为普通知识问答，且消息无多步任务特征");
         }
 
         // 规则 1：任务连接词 → 多个子任务存在顺序关系
@@ -115,5 +124,25 @@ public class ExecutionStrategyResolver {
      */
     private int countMatches(Pattern pattern, String input) {
         return (int) pattern.matcher(input).results().count();
+    }
+
+    /**
+     * 探测消息是否含<b>任何</b>多步任务文本特征（连接词 / 分号 / 多非空行）。
+     *
+     * <p>供规则 0 使用：GENERAL_QA 短路前先看一眼——有特征说明可能是
+     * "披着问答外衣的多步任务"（如"帮我计算 X 然后乘 2"被意图分类为问答），
+     * 不能短路，交给小模型终审；无特征才安心短路 DIRECT。</p>
+     *
+     * @param message 用户消息
+     * @return true = 含至少一种多步特征
+     */
+    private boolean hasMultiStepTextFeature(String message) {
+        if (MULTI_TASK_CONNECTORS.matcher(message).find()) {
+            return true;
+        }
+        if (countMatches(SEMICOLON, message) >= 1) {
+            return true;
+        }
+        return message.lines().filter(l -> !l.isBlank()).count() >= MULTI_LINE_THRESHOLD;
     }
 }

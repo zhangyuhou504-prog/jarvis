@@ -8,6 +8,10 @@ import com.example.jarvis.exception.AiServiceException;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.model.IntentResult;
 import com.example.jarvis.router.ModelRouter;
+import com.example.jarvis.strategy.ExecutionStrategy;
+import com.example.jarvis.strategy.StrategyContext;
+import com.example.jarvis.strategy.StrategyResolver;
+import com.example.jarvis.strategy.StrategyResult;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
@@ -48,6 +52,7 @@ public class ChatService {
     private final ModelRouter modelRouter;
     private final IntentService intentService;
     private final ToolLoopService toolLoopService;
+    private final StrategyResolver strategyResolver;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
 
@@ -214,27 +219,65 @@ public class ChatService {
      * @param request 对话请求
      * @return 包含模型最终答案的响应
      */
+    /**
+     * 工具对话（非流式）：意图识别 → <b>执行策略分流（8.2.7）</b> → 模型路由 → 工具调用闭环。
+     *
+     * <p><b>策略分流</b>：意图识别后先经 {@link StrategyResolver} 判定执行策略——</p>
+     * <ul>
+     *   <li>{@code DIRECT}：走原有链路（模型路由 → {@link ToolLoopService} 工具闭环）</li>
+     *   <li>{@code PLANNED}：应走规划路径（Planner → Validator → Scheduler → Executor）；
+     *       PlanExecutor 尚未实现（8.4），当前明确报错告知，不静默降级</li>
+     * </ul>
+     *
+     * <p>策略判断携带完整上下文（用户消息、意图结果、conversationId、会话历史），
+     * 与意图识别解耦：IntentService 只管识别意图，StrategyResolver 只管选策略，
+     * 本方法（上层编排）负责按策略分发。</p>
+     *
+     * @param request 对话请求
+     * @return 包含模型最终答案的响应
+     */
     public ChatResponse chatWithTools(ChatRequest request) {
         log.info("收到工具对话请求: conversationId={}, message={}",
                 request.getConversationId(), request.getMessage());
 
-        // 意图识别 + 模型路由（与流式链路同一套规则）
+        // 意图识别（与流式链路同一套规则）
         IntentResult intent = null;
         if (intentEnabled) {
             intent = intentService.recognize(request.getMessage());
             log.info("意图识别结果: intent={}, confidence={}, reason={}",
                     intent.intent(), intent.confidence(), intent.reason());
         }
-        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request, intent));
-        log.info("本次工具对话使用模型: modelId={}, modelName={}, baseUrl={}",
-                client.modelId(), client.modelName(), client.baseUrl());
 
-        // 组装上下文：system + 会话历史 + 当前 user
+        // 加载会话上下文（策略判断需要 history，避免"接着说"类指代在无上下文时误判）
         Conversation conversation = (request.getConversationId() == null || request.getConversationId().isBlank())
                 ? null
                 : conversationService.getConversation(request.getConversationId());
         List<ChatMessage> history = conversation == null ? List.of() : snapshotHistory(conversation);
 
+        // ---------- 8.2.7 执行策略选择与分流 ----------
+        // Java 规则优先，规则未命中由小模型兜底；conversationId/history 原样带入判断
+        StrategyContext strategyContext = new StrategyContext(
+                request.getMessage(), intent, request.getConversationId(), history);
+        StrategyResult strategyResult = strategyResolver.resolve(strategyContext);
+        log.info("执行策略判定: conversationId={}, strategy={}, reason={}",
+                request.getConversationId(), strategyResult.strategy(), strategyResult.reason());
+
+        if (strategyResult.strategy() == ExecutionStrategy.PLANNED) {
+            // 规划路径：Planner → PlanValidator → PlanScheduler → PlanExecutor。
+            // PlanExecutor 尚未实现（8.4），此处明确告知而非静默降级为 DIRECT——
+            // 把规划任务当普通对话执行会产生看似正常实则错误的结果
+            throw new AiServiceException(
+                    "该任务已被判定为需要规划执行（PLANNED），但执行器尚未上线，暂不支持: "
+                            + strategyResult.reason());
+        }
+
+        // ---------- DIRECT：直接执行路径（原有链路不动） ----------
+        // 模型路由 + 工具闭环
+        LlmClientFactory.ResolvedLlmClient client = llmClientFactory.getClient(modelRouter.route(request, intent));
+        log.info("本次工具对话使用模型: modelId={}, modelName={}, baseUrl={}",
+                client.modelId(), client.modelName(), client.baseUrl());
+
+        // 组装上下文：system + 会话历史 + 当前 user
         ArrayNode messages = buildMessages(resolveSystemPrompt(request), history, request.getMessage());
 
         // 工具闭环（内部多轮非流式调用，直到模型给出最终答案）

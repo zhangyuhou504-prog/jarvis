@@ -99,3 +99,12 @@ jarvis:
     # 计划生成总尝试次数（首次 + 重试）。失败时把错误原因回传给模型重试，
     # 超限后抛出最后一次异常。默认 2 = 首次 + 1 次重试
     max-attempts: 2
+
+  # 执行策略判断（第八阶段 8.2）配置
+  strategy:
+    # 策略判断小模型使用的模型 ID。
+    # 注意：必须是 jarvis.llm.models 中已注册的模型 key（如 mxbc-qwen），
+    # 不是平台原始模型名（qwen3.8-27b）。空/null 时 StrategyClassifier
+    # 回落 jarvis.llm.default-model。
+    # 独立于聊天模型与 Planner 模型，换模型只改这里。
+    model-id: mxbc-qwen

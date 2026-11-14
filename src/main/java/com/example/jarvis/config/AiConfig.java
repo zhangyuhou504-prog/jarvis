@@ -24,7 +24,7 @@ import java.nio.charset.StandardCharsets;
  * 按模型 ID 解析（多平台），不在本类构建。</p>
  */
 @Configuration
-@EnableConfigurationProperties(LlmProperties.class)
+@EnableConfigurationProperties({LlmProperties.class, StrategyProperties.class})
 public class AiConfig {
 
     /**

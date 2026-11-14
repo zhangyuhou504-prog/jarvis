@@ -141,6 +141,35 @@ class ExecutionStrategyResolverTest {
         assertEquals(ExecutionStrategy.DIRECT, r.strategy());
     }
 
+    // ---- 修复回归：GENERAL_QA + 多步文本特征 → 不短路，交给小模型 ----
+
+    @Test
+    void generalQaWithConnectorShouldNotShortCircuit() {
+        // 实测教训：意图分类器把"计算 X 然后乘 2"归类为 GENERAL_QA（无计算类目）。
+        // 修复后：有连接词特征时不短路 → 规则 1 判 PLANNED（连接词规则接管）
+        StrategyResult r = resolver.resolve(
+                contextOf("帮我计算 128 × 256，然后把结果乘以 2", IntentType.GENERAL_QA));
+        assertNotNull(r, "GENERAL_QA + 连接词特征不能被意图短路放行");
+        assertEquals(ExecutionStrategy.PLANNED, r.strategy());
+    }
+
+    @Test
+    void generalQaWithMultiLineShouldNotShortCircuit() {
+        // GENERAL_QA + 多行指令 → 不短路（多行特征触发）
+        StrategyResult r = resolver.resolve(
+                contextOf("查询订单服务日志\n查询支付服务日志", IntentType.GENERAL_QA));
+        assertNotNull(r);
+        assertEquals(ExecutionStrategy.PLANNED, r.strategy());
+    }
+
+    @Test
+    void generalQaWithoutFeatureShouldStillShortCircuit() {
+        // 无特征的纯问答仍短路 DIRECT（不多花小模型调用）——短路收益保留
+        StrategyResult r = resolver.resolve(contextOf("什么是 Redis？", IntentType.GENERAL_QA));
+        assertNotNull(r);
+        assertEquals(ExecutionStrategy.DIRECT, r.strategy());
+    }
+
     // ---- 数据结构不变量 ----
 
     @Test
