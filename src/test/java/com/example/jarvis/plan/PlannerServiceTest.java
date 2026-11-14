@@ -40,14 +40,16 @@ class PlannerServiceTest {
         when(factory.getClient(null)).thenReturn(client);
 
         plannerService = new PlannerService(llmClientService, factory, JSON,
+                new PlanValidator(),
                 new ClassPathResource("prompts/planner-prompt.md"));
+        org.springframework.test.util.ReflectionTestUtils.setField(plannerService, "maxAttempts", 2);
         plannerService.init();
     }
 
     /**
-     * 构造一个"模型返回指定 content"的响应。
+     * 构造一个"模型返回指定 content"的响应（不 stub，供连续 thenReturn 使用）。
      */
-    private void mockModelContent(String content) {
+    private ObjectNode responseOf(String content) {
         ObjectNode message = JSON.createObjectNode();
         message.put("role", "assistant");
         message.put("content", content);
@@ -56,7 +58,14 @@ class PlannerServiceTest {
         choice.put("finish_reason", "stop");
         ObjectNode response = JSON.createObjectNode();
         response.putArray("choices").add(choice);
-        when(llmClientService.chat(any(), any())).thenReturn(Mono.just(response));
+        return response;
+    }
+
+    /**
+     * stub 模型始终返回指定 content（单次调用场景）。
+     */
+    private void mockModelContent(String content) {
+        when(llmClientService.chat(any(), any())).thenReturn(Mono.just(responseOf(content)));
     }
 
     @Test
@@ -103,5 +112,106 @@ class PlannerServiceTest {
     void shouldThrowOnBlankContent() {
         mockModelContent("   ");
         assertThrows(IllegalStateException.class, () -> plannerService.createPlan("目标"));
+    }
+
+    @Test
+    void shouldRejectPlanWithDuplicateStepIds() {
+        // 模型返回重复 stepId 的计划 → PlanValidator 拦截
+        mockModelContent("""
+                {
+                  "goal": "目标",
+                  "steps": [
+                    {"stepId": "step_1", "description": "步骤一", "dependsOn": []},
+                    {"stepId": "step_1", "description": "步骤二", "dependsOn": []}
+                  ]
+                }
+                """);
+
+        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+    }
+
+    @Test
+    void shouldRejectPlanWithMissingDependency() {
+        // 模型返回依赖不存在步骤的计划 → PlanValidator 拦截
+        mockModelContent("""
+                {
+                  "goal": "目标",
+                  "steps": [
+                    {"stepId": "step_1", "description": "步骤一", "dependsOn": ["step_99"]}
+                  ]
+                }
+                """);
+
+        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+    }
+
+    @Test
+    void shouldRejectPlanWithCycle() {
+        // 模型返回循环依赖的计划 → PlanValidator 拦截
+        mockModelContent("""
+                {
+                  "goal": "目标",
+                  "steps": [
+                    {"stepId": "step_1", "description": "步骤一", "dependsOn": ["step_2"]},
+                    {"stepId": "step_2", "description": "步骤二", "dependsOn": ["step_1"]}
+                  ]
+                }
+                """);
+
+        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+    }
+
+    // ---- 重试机制 ----
+
+    @Test
+    void shouldRetryAndSucceedWhenFirstAttemptFails() {
+        // 首次返回非法 JSON，重试后返回合法计划 → 成功，模型被调用 2 次
+        when(llmClientService.chat(any(), any()))
+                .thenReturn(Mono.just(responseOf("这不是 JSON")))
+                .thenReturn(Mono.just(responseOf("""
+                        {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
+                        """)));
+
+        Plan plan = plannerService.createPlan("目标");
+        assertEquals(1, plan.steps().size());
+
+        org.mockito.ArgumentCaptor<ObjectNode> captor = org.mockito.ArgumentCaptor.forClass(ObjectNode.class);
+        org.mockito.Mockito.verify(llmClientService, org.mockito.Mockito.times(2)).chat(any(), captor.capture());
+        // 第二次请求的 user 消息应附带修正指令与上次错误原因
+        String secondUserMsg = captor.getAllValues().get(1)
+                .path("messages").get(1).path("content").asText();
+        assertTrue(secondUserMsg.contains("修正指令"));
+        assertTrue(secondUserMsg.contains("格式不正确"));
+    }
+
+    @Test
+    void shouldThrowLastErrorWhenAllAttemptsFail() {
+        // 两次都返回循环依赖的计划 → 重试耗尽，抛出最后一次 IllegalArgumentException
+        mockModelContent("""
+                {
+                  "goal": "目标",
+                  "steps": [
+                    {"stepId": "step_1", "description": "步骤一", "dependsOn": ["step_2"]},
+                    {"stepId": "step_2", "description": "步骤二", "dependsOn": ["step_1"]}
+                  ]
+                }
+                """);
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> plannerService.createPlan("目标"));
+        assertTrue(ex.getMessage().contains("循环依赖"));
+        org.mockito.Mockito.verify(llmClientService, org.mockito.Mockito.times(2)).chat(any(), any());
+    }
+
+    @Test
+    void shouldNotRetryWhenFirstAttemptSucceeds() {
+        mockModelContent("""
+                {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
+                """);
+
+        plannerService.createPlan("目标");
+        // 一次成功不应触发重试
+        org.mockito.Mockito.verify(llmClientService, org.mockito.Mockito.times(1)).chat(any(), any());
     }
 }

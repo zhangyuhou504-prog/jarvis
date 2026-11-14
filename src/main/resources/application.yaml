@@ -46,6 +46,14 @@ jarvis:
         api-key: sk-aigw-IA7nb9o.ZnpewESUFAMxWNClaJoIqR8QZXnYGVuh
 
     models:
+      mxbc-claude:
+        connection: mxbc
+        model-name: claude-opus-5-5
+        temperature: 0.7
+        max-tokens: 4096
+        # 公司网关特定扩展参数：关闭思考阶段，规避其推理模型思考期整段缓冲导致的流式超时。
+        # 平台扩展参数按模型配置，其他平台（如 gjld）不配即不下发。
+        enable-thinking: false
       gjld-qwen:
         connection: gjld
         model-name: Qwen/Qwen3.8-27B
@@ -85,3 +93,9 @@ jarvis:
     call-timeout-seconds: 120
     # getCurrentTime 工具：用户未指定时区时使用的默认时区（IANA 格式）
     default-timezone: Asia/Shanghai
+
+  # 任务规划（Planner）配置
+  planner:
+    # 计划生成总尝试次数（首次 + 重试）。失败时把错误原因回传给模型重试，
+    # 超限后抛出最后一次异常。默认 2 = 首次 + 1 次重试
+    max-attempts: 2
