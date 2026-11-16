@@ -2,10 +2,17 @@ package com.example.jarvis.service;
 
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
-import com.example.jarvis.exception.AiServiceException;
+import com.example.jarvis.execution.ExecutionContext;
+import com.example.jarvis.execution.PlanExecutionReportBuilder;
+import com.example.jarvis.execution.PlanExecutor;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.model.IntentResult;
 import com.example.jarvis.model.IntentType;
+import com.example.jarvis.plan.Plan;
+import com.example.jarvis.plan.PlanOrchestrationService;
+import com.example.jarvis.plan.PlanResult;
+import com.example.jarvis.plan.PlanScheduler;
+import com.example.jarvis.plan.PlanStep;
 import com.example.jarvis.router.ModelRouter;
 import com.example.jarvis.strategy.ExecutionStrategy;
 import com.example.jarvis.strategy.StrategyContext;
@@ -35,13 +42,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * ChatService 策略分流测试（8.2.7）。
+ * ChatService 策略分流测试（8.2.7 + 8.6.3.2）。
  *
  * <p>验证 chatWithTools 编排链路：意图 → 策略判断（上下文完整传递）→
- * DIRECT 走工具闭环 / PLANNED 拒绝执行。重点用 Mockito 验证：</p>
+ * DIRECT 走工具闭环 / PLANNED 走规划执行链路（生成计划 → 执行 → 报告）。
+ * 重点用 Mockito 验证：</p>
  * <ul>
  *   <li>conversationId 与 history 原样进入 StrategyContext（不丢失）</li>
- *   <li>PLANNED 不触发模型路由与工具闭环</li>
+ *   <li>PLANNED 不触发模型路由与工具闭环（走规划链路）</li>
+ *   <li>PLANNED 产出执行报告作为回答，异常上抛不降级</li>
  * </ul>
  */
 class ChatServiceStrategyRoutingTest {
@@ -54,6 +63,9 @@ class ChatServiceStrategyRoutingTest {
     private StrategyResolver strategyResolver;
     private PromptTemplateService promptTemplateService;
     private ConversationService conversationService;
+    private PlanOrchestrationService planOrchestrationService;
+    private PlanExecutor planExecutor;
+    private PlanExecutionReportBuilder planExecutionReportBuilder;
     private ChatService chatService;
 
     @BeforeEach
@@ -66,10 +78,14 @@ class ChatServiceStrategyRoutingTest {
         strategyResolver = mock(StrategyResolver.class);
         promptTemplateService = mock(PromptTemplateService.class);
         conversationService = mock(ConversationService.class);
+        planOrchestrationService = mock(PlanOrchestrationService.class);
+        planExecutor = mock(PlanExecutor.class);
+        planExecutionReportBuilder = mock(PlanExecutionReportBuilder.class);
 
         chatService = new ChatService(chatClient, llmClientFactory, modelRouter,
                 intentService, toolLoopService, strategyResolver,
-                promptTemplateService, conversationService);
+                promptTemplateService, conversationService,
+                planOrchestrationService, planExecutor, planExecutionReportBuilder);
         ReflectionTestUtils.setField(chatService, "intentEnabled", true);
         // 历史快照上限（默认 @Value 注入在生产环境生效，单测需手动设值）
         ReflectionTestUtils.setField(chatService, "maxHistoryMessages", 20);
@@ -106,23 +122,91 @@ class ChatServiceStrategyRoutingTest {
         verify(strategyResolver, times(1)).resolve(any());
     }
 
-    // ---- 场景 3/4：策略 PLANNED → 拒绝执行（执行器未上线） ----
+    // ---- 场景 3/4：策略 PLANNED → 规划执行链路（8.6.3.2）----
 
     @Test
-    void plannedStrategyShouldRejectUntilExecutorReady() {
+    void plannedStrategyShouldExecutePlanAndReturnReport() {
+        // PLANNED 全链路：createPlan → execute → 报告作为回答，不碰 DIRECT 的路由/工具闭环
         when(intentService.recognize(anyString()))
                 .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
         when(strategyResolver.resolve(any()))
                 .thenReturn(new StrategyResult(ExecutionStrategy.PLANNED, "第二步依赖第一步的计算结果"));
 
-        AiServiceException ex = assertThrows(AiServiceException.class,
-                () -> chatService.chatWithTools(requestOf("计算 128×256 然后乘以 2", "conv-1")));
+        Plan plan = new Plan("计算任务", List.of(
+                new PlanStep("step_1", "计算 128 × 256", List.of()),
+                new PlanStep("step_2", "将上一步结果乘以 2", List.of("step_1"))
+        ));
+        PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
+        when(planOrchestrationService.createPlan("计算 128×256 然后乘以 2"))
+                .thenReturn(planResult);
 
-        assertTrue(ex.getMessage().contains("PLANNED"));
-        assertTrue(ex.getMessage().contains("依赖第一步的计算结果"));
-        // 关键：PLANNED 绝不能继续走直接执行链路（静默降级会产生错误结果）
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");
+        context.markSuccess("step_1", "32768");
+        context.markRunning("step_2");
+        context.markSuccess("step_2", "65536");
+        when(planExecutor.execute(planResult)).thenReturn(context);
+        when(planExecutionReportBuilder.build(context)).thenReturn("任务执行报告\n整体状态：全部成功");
+
+        ChatResponse response = chatService.chatWithTools(requestOf("计算 128×256 然后乘以 2", null));
+
+        assertEquals("任务执行报告\n整体状态：全部成功", response.getAnswer());
+        // 规划链路各环节恰好一次
+        verify(planOrchestrationService, times(1)).createPlan("计算 128×256 然后乘以 2");
+        verify(planExecutor, times(1)).execute(planResult);
+        verify(planExecutionReportBuilder, times(1)).build(context);
+        // PLANNED 绝不走 DIRECT 链路（模型路由 / 工具闭环零调用）
         verify(modelRouter, never()).route(any(), any());
         verify(toolLoopService, never()).run(any(), any());
+    }
+
+    @Test
+    void plannedPathShouldPropagatePlanGenerationFailure() {
+        // 计划生成失败 → 异常向上抛出，绝不静默降级成 DIRECT
+        when(intentService.recognize(anyString()))
+                .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
+        when(strategyResolver.resolve(any()))
+                .thenReturn(new StrategyResult(ExecutionStrategy.PLANNED, "多步骤依赖"));
+        when(planOrchestrationService.createPlan(anyString()))
+                .thenThrow(new IllegalStateException("计划生成失败：模型无返回"));
+
+        assertThrows(IllegalStateException.class,
+                () -> chatService.chatWithTools(requestOf("计算 128×256 然后乘以 2", null)));
+
+        // 生成失败后不执行任何后续环节
+        verify(planExecutor, never()).execute(any());
+        verify(planExecutionReportBuilder, never()).build(any());
+        verify(toolLoopService, never()).run(any(), any());
+    }
+
+    @Test
+    void plannedPathShouldSaveTurnWhenConversationExists() {
+        // PLANNED 与 DIRECT 同口径：conversation 存在时保存完整问答
+        when(intentService.recognize(anyString()))
+                .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
+        when(strategyResolver.resolve(any()))
+                .thenReturn(new StrategyResult(ExecutionStrategy.PLANNED, "多步骤依赖"));
+
+        com.example.jarvis.domain.Conversation conversation =
+                new com.example.jarvis.domain.Conversation("conv-7");
+        when(conversationService.getConversation("conv-7")).thenReturn(conversation);
+
+        Plan plan = new Plan("单步", List.of(new PlanStep("step_1", "唯一步骤", List.of())));
+        PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
+        when(planOrchestrationService.createPlan(anyString())).thenReturn(planResult);
+
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");
+        context.markSuccess("step_1", "完成");
+        when(planExecutor.execute(planResult)).thenReturn(context);
+        when(planExecutionReportBuilder.build(context)).thenReturn("报告");
+
+        chatService.chatWithTools(requestOf("帮我规划并执行", "conv-7"));
+
+        // 问答对完整写入（user = 用户消息，assistant = 报告）
+        assertEquals(2, conversation.getMessages().size());
+        assertEquals("帮我规划并执行", conversation.getMessages().get(0).getContent());
+        assertEquals("报告", conversation.getMessages().get(1).getContent());
     }
 
     // ---- 场景 5：Java 规则命中 → 不调用小模型（StrategyResolver 内部已验证，

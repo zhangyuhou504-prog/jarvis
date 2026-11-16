@@ -84,8 +84,15 @@ class PlanExecutorTest {
         ExecutionContext context = executor.execute(linearPlan);
 
         assertEquals(StepExecutionStatus.FAILED, context.getStepExecution("step_1").status());
+        // 8.6.1：FAILED 的 error 承载异常信息
+        assertEquals("模型调用失败", context.getStepExecution("step_1").error());
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_2").status());
+        // 8.6.1：SKIPPED 的 error 承载跳过原因（指明具体未成功的依赖）
+        assertEquals("前置依赖步骤未成功: step_1",
+                context.getStepExecution("step_2").error());
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_3").status());
+        assertEquals("前置依赖步骤未成功: step_2",
+                context.getStepExecution("step_3").error());
         // 失败步骤只调用一次（没有重试，重试策略在 8.6）
         verify(toolLoopService, times(1)).run(any(), any());
     }
@@ -103,7 +110,9 @@ class PlanExecutorTest {
         assertEquals(StepExecutionStatus.SUCCESS, context.getStepExecution("step_2").status());
         // step_3 依赖 step_1（FAILED）→ SKIPPED；step_4 依赖 step_3（SKIPPED）→ SKIPPED
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_3").status());
-        assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_4").status());
+        // step_4 依赖 step_2（SUCCESS）+ step_3（SKIPPED）→ 跳过原因只指明未成功的那部分
+        assertEquals("前置依赖步骤未成功: step_3",
+                context.getStepExecution("step_4").error());
         // 失败 + 成功各一次，SKIPPED 的两步不调用模型
         verify(toolLoopService, times(2)).run(any(), any());
     }
@@ -214,6 +223,8 @@ class PlanExecutorTest {
 
         assertEquals(StepExecutionStatus.FAILED, context.getStepExecution("step_1").status());
         assertNull(context.getStepExecution("step_1").result());
+        // 8.6.1：闭环失败的 error 是统一的闭环级说明（answer 不混入 result/error）
+        assertEquals("存在未恢复的工具调用失败", context.getStepExecution("step_1").error());
         // 下游级联跳过
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_2").status());
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_3").status());
@@ -229,6 +240,7 @@ class PlanExecutorTest {
         ExecutionContext context = executor.execute(diamondPlan);
 
         assertEquals(StepExecutionStatus.FAILED, context.getStepExecution("step_1").status());
+        assertEquals("存在未恢复的工具调用失败", context.getStepExecution("step_1").error());
         assertEquals(StepExecutionStatus.SUCCESS, context.getStepExecution("step_2").status());
         assertEquals("乙的独立结果", context.getStepExecution("step_2").result());
         assertEquals(StepExecutionStatus.SKIPPED, context.getStepExecution("step_3").status());
@@ -286,7 +298,7 @@ class PlanExecutorTest {
         // 防御性兜底：依赖 FAILED 时取数应明确报错（正常路径有守门不会走到这）
         ExecutionContext context = new ExecutionContext(diamondPlan);
         context.markRunning("step_1");
-        context.markFailed("step_1");
+        context.markFailed("step_1", "查询失败");
 
         PlanStep step3 = new PlanStep("step_3", "丙", List.of("step_1"));
 

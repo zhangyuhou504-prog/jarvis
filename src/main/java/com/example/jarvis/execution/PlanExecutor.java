@@ -118,9 +118,17 @@ public class PlanExecutor {
             // step_1 失败时，依赖它的 step_2 不应执行。不满足则标记 SKIPPED
             // （级联：SKIPPED ≠ SUCCESS，依赖链下游会因依赖不满足继续被跳过）
             if (!context.areDependenciesSatisfied(step.stepId())) {
+                // 记录跳过原因（8.6.1）：具体指出哪些依赖未成功，便于诊断
+                String unsatisfied = step.dependsOn().stream()
+                        .filter(dep -> {
+                            StepExecution depExec = context.getStepExecution(dep);
+                            return depExec == null
+                                    || depExec.status() != StepExecutionStatus.SUCCESS;
+                        })
+                        .collect(java.util.stream.Collectors.joining(", "));
                 log.info("依赖未满足，跳过步骤: stepId={}, dependsOn={}",
                         step.stepId(), step.dependsOn());
-                context.markSkipped(step.stepId());
+                context.markSkipped(step.stepId(), "前置依赖步骤未成功: " + unsatisfied);
                 continue;
             }
 
@@ -143,14 +151,16 @@ public class PlanExecutor {
                 } else {
                     // 闭环未成功完成（最终存在未恢复的工具失败 / 轮数上限）：
                     // 步骤 FAILED。失败时模型给出的文本不作为产出，仅随日志留痕
-                    context.markFailed(step.stepId());
+                    context.markFailed(step.stepId(),
+                            "存在未恢复的工具调用失败");
                     log.warn("步骤闭环失败: stepId={}, answer={}",
                             step.stepId(), loopResult.answer());
                 }
             } catch (RuntimeException e) {
                 // 决策点 B：单步失败不中断 execute，下游由依赖检查级联 SKIPPED，
                 // 无关步骤照常执行；整体成败由调用方根据状态汇总判断
-                context.markFailed(step.stepId());
+                // 8.6.1：异常信息记录进 error（可能含敏感参数，对外展示前需脱敏）
+                context.markFailed(step.stepId(), e.getMessage());
                 log.error("步骤执行失败: stepId={}", step.stepId(), e);
             }
         }

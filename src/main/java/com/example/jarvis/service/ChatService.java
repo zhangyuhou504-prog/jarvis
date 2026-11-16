@@ -4,9 +4,14 @@ import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.domain.Conversation;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
+import com.example.jarvis.execution.ExecutionContext;
+import com.example.jarvis.execution.PlanExecutionReportBuilder;
+import com.example.jarvis.execution.PlanExecutor;
 import com.example.jarvis.exception.AiServiceException;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.model.IntentResult;
+import com.example.jarvis.plan.PlanOrchestrationService;
+import com.example.jarvis.plan.PlanResult;
 import com.example.jarvis.router.ModelRouter;
 import com.example.jarvis.strategy.ExecutionStrategy;
 import com.example.jarvis.strategy.StrategyContext;
@@ -55,6 +60,9 @@ public class ChatService {
     private final StrategyResolver strategyResolver;
     private final PromptTemplateService promptTemplateService;
     private final ConversationService conversationService;
+    private final PlanOrchestrationService planOrchestrationService;
+    private final PlanExecutor planExecutor;
+    private final PlanExecutionReportBuilder planExecutionReportBuilder;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -208,33 +216,24 @@ public class ChatService {
     }
 
     /**
-     * 工具对话（非流式）：意图识别 → 模型路由 → 工具调用闭环 → 返回最终答案。
+     * 工具对话（非流式）：意图识别 → <b>执行策略分流（8.2.7 / 8.6.3.2）</b> → 分路执行。
      *
-     * <p>与 {@link #chatStream} 的区别：本方法走 {@link ToolLoopService} 的非流式工具闭环
-     * （模型可调用 multiply 等 Java 工具，多轮执行直到给出最终答案），
-     * 客户端拿到的是完整答案而非文本流。已验收的 SSE 流式链路不受影响。</p>
+     * <p>与 {@link #chatStream} 的区别：本方法走非流式链路，客户端拿到完整答案。</p>
      *
-     * <p>模型选择规则与流式一致：指定 modelId 优先 → 模板映射 → 意图映射 → 默认模型。</p>
-     *
-     * @param request 对话请求
-     * @return 包含模型最终答案的响应
-     */
-    /**
-     * 工具对话（非流式）：意图识别 → <b>执行策略分流（8.2.7）</b> → 模型路由 → 工具调用闭环。
-     *
-     * <p><b>策略分流</b>：意图识别后先经 {@link StrategyResolver} 判定执行策略——</p>
+     * <p><b>策略分流</b>：意图识别并加载会话历史后，经 {@link StrategyResolver} 判定——</p>
      * <ul>
-     *   <li>{@code DIRECT}：走原有链路（模型路由 → {@link ToolLoopService} 工具闭环）</li>
-     *   <li>{@code PLANNED}：应走规划路径（Planner → Validator → Scheduler → Executor）；
-     *       PlanExecutor 尚未实现（8.4），当前明确报错告知，不静默降级</li>
+     *   <li>{@code DIRECT}：原有链路（模型路由 → {@link ToolLoopService} 工具闭环）</li>
+     *   <li>{@code PLANNED}：规划执行链路（{@link PlanOrchestrationService} 生成计划
+     *       → {@link PlanExecutor} 逐步骤执行 → {@link PlanExecutionReportBuilder}
+     *       组装执行报告 → 以报告文本作为回答返回）。计划生成失败异常上抛
+     *       不降级；部分步骤失败不影响报告生成（失败详情在报告内向用户解释）</li>
      * </ul>
      *
-     * <p>策略判断携带完整上下文（用户消息、意图结果、conversationId、会话历史），
-     * 与意图识别解耦：IntentService 只管识别意图，StrategyResolver 只管选策略，
-     * 本方法（上层编排）负责按策略分发。</p>
+     * <p>两条路径对会话保存同口径：只保存完整的用户问题与最终回答。
+     * PLANNED 的报告含每步状态与失败原因，替代 8.2.7 的"执行器未上线"报错。</p>
      *
      * @param request 对话请求
-     * @return 包含模型最终答案的响应
+     * @return 包含模型最终答案（或计划执行报告）的响应
      */
     public ChatResponse chatWithTools(ChatRequest request) {
         log.info("收到工具对话请求: conversationId={}, message={}",
@@ -263,12 +262,28 @@ public class ChatService {
                 request.getConversationId(), strategyResult.strategy(), strategyResult.reason());
 
         if (strategyResult.strategy() == ExecutionStrategy.PLANNED) {
-            // 规划路径：Planner → PlanValidator → PlanScheduler → PlanExecutor。
-            // PlanExecutor 尚未实现（8.4），此处明确告知而非静默降级为 DIRECT——
-            // 把规划任务当普通对话执行会产生看似正常实则错误的结果
-            throw new AiServiceException(
-                    "该任务已被判定为需要规划执行（PLANNED），但执行器尚未上线，暂不支持: "
-                            + strategyResult.reason());
+            // ---------- 8.6.3.2 PLANNED：规划执行路径 ----------
+            // Planner → Validator → Scheduler（createPlan 内完成）
+            // → Executor（逐步骤工具闭环，失败级联跳过）→ ReportBuilder → 回复
+            // 1. 生成计划并完成校验与拓扑排序。
+            //    计划生成失败（模型无返回/JSON 非法/语义不合法/重试耗尽）异常直接
+            //    向上抛出，不静默降级为 DIRECT——把规划任务当普通对话执行会
+            //    产生看似正常实则错误的结果
+            PlanResult planResult = planOrchestrationService.createPlan(request.getMessage());
+
+            // 2. 执行计划。PlanExecutor 对单步失败 markFailed 后 continue
+            //    （下游级联 SKIPPED、无关步骤照常执行），永远正常返回
+            //    ExecutionContext——部分步骤失败不影响报告生成
+            ExecutionContext context = planExecutor.execute(planResult);
+
+            // 3. 生成执行报告（整体汇总 + 每步状态/结果/原因，均来自执行上下文）
+            String answer = planExecutionReportBuilder.build(context);
+
+            // 4. 保存完整问答（与 DIRECT 同口径：只保存完整的用户问题与最终回答）
+            if (conversation != null) {
+                appendTurn(conversation, request.getMessage(), answer);
+            }
+            return new ChatResponse(answer);
         }
 
         // ---------- DIRECT：直接执行路径（原有链路不动） ----------

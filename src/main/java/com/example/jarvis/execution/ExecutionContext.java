@@ -105,7 +105,7 @@ public class ExecutionContext {
             throw new IllegalStateException(
                     "非法状态转换: " + stepId + " " + current.status() + " → RUNNING（仅 PENDING 可启动）");
         }
-        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.RUNNING, null));
+        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.RUNNING, null, null));
     }
 
     /**
@@ -122,45 +122,52 @@ public class ExecutionContext {
             throw new IllegalStateException(
                     "非法状态转换: " + stepId + " " + current.status() + " → SUCCESS（仅 RUNNING 可完成）");
         }
-        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.SUCCESS, result));
+        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.SUCCESS, result, null));
     }
 
     /**
-     * 标记步骤执行失败：RUNNING → FAILED。
+     * 标记步骤执行失败：RUNNING → FAILED，记录失败原因（8.6.1）。
      *
-     * <p>失败详情（异常信息、重试计数等）8.6 失败处理阶段再扩展，当前只记录状态。</p>
+     * <p>FAILED：有 error、无 result。失败原因供调用方向用户解释
+     * "为什么这步没产出"（AIOps 诊断场景）；异常信息可能含敏感参数，
+     * 对外展示前需脱敏。</p>
      *
      * @param stepId 步骤标识
+     * @param error  失败原因（异常信息 / 工具闭环失败说明）
      * @throws IllegalArgumentException stepId 不在计划中
      * @throws IllegalStateException    当前状态不是 RUNNING
      */
-    public void markFailed(String stepId) {
+    public void markFailed(String stepId, String error) {
         StepExecution current = requireStep(stepId);
         if (current.status() != StepExecutionStatus.RUNNING) {
             throw new IllegalStateException(
                     "非法状态转换: " + stepId + " " + current.status() + " → FAILED（仅 RUNNING 可失败）");
         }
-        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.FAILED, null));
+        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.FAILED, null, error));
     }
 
     /**
-     * 标记步骤被跳过：PENDING → SKIPPED（依赖失败，级联跳过）。
+     * 标记步骤被跳过：PENDING → SKIPPED，记录跳过原因（8.6.1）。
      *
      * <p>与 FAILED 的区别：FAILED 是"执行了但失败"，SKIPPED 是"因依赖不满足
      * 从未启动"。PENDING 直接 → SKIPPED 不经过 RUNNING——跳过的步骤没有
      * 执行动作，如实表达"从未启动"。终态。</p>
      *
+     * <p>error 记录跳过原因（如"前置依赖步骤未成功: step_1"），与 FAILED 的
+     * 失败原因同源——对用户都是"这步为什么没有产出"。</p>
+     *
      * @param stepId 步骤标识
+     * @param reason 跳过原因
      * @throws IllegalArgumentException stepId 不在计划中
      * @throws IllegalStateException    当前状态不是 PENDING（已启动/已终态的步骤不能跳过）
      */
-    public void markSkipped(String stepId) {
+    public void markSkipped(String stepId, String reason) {
         StepExecution current = requireStep(stepId);
         if (current.status() != StepExecutionStatus.PENDING) {
             throw new IllegalStateException(
                     "非法状态转换: " + stepId + " " + current.status() + " → SKIPPED（仅 PENDING 可跳过）");
         }
-        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.SKIPPED, null));
+        stepExecutions.put(stepId, new StepExecution(StepExecutionStatus.SKIPPED, null, reason));
     }
 
     /**
@@ -186,6 +193,63 @@ public class ExecutionContext {
                     StepExecution depExec = stepExecutions.get(dep);
                     return depExec != null && depExec.status() == StepExecutionStatus.SUCCESS;
                 });
+    }
+
+    /**
+     * 汇总计划执行结果（8.6.2）：统计全部步骤终态并计算整体状态。
+     *
+     * <p><b>为什么汇总放在本类</b>：本类已管理所有步骤状态，汇总只需读取
+     * {@code stepExecutions}——不让 PlanExecutor 承担额外统计职责，
+     * 调用方通过一个入口同时拿到执行详情与整体结论。</p>
+     *
+     * <p><b>整体状态判定规则</b>：</p>
+     * <ul>
+     *   <li>所有步骤均成功 → SUCCESS</li>
+     *   <li>有成功步骤，同时存在失败或跳过步骤 → PARTIAL_SUCCESS</li>
+     *   <li>没有任何成功步骤 → FAILED</li>
+     * </ul>
+     *
+     * <p><b>统计口径是最终状态，不是执行次数</b>：每步骤只按其终态计入一个
+     * 计数（重试后成功的步骤计入 successCount 一次）；PENDING/RUNNING
+     * 不属于终态，执行中途调用 summarize 会把它们排除在三个计数之外
+     * （totalSteps 仍为总步骤数）——常规用法是执行结束后再汇总。</p>
+     *
+     * @return 执行结果汇总（不可变快照：步骤终态 → 计数 + 整体状态）
+     */
+    public PlanExecutionSummary summarize() {
+        int successCount = 0;
+        int failedCount = 0;
+        int skippedCount = 0;
+
+        for (StepExecution execution : stepExecutions.values()) {
+            switch (execution.status()) {
+                case SUCCESS -> successCount++;
+                case FAILED -> failedCount++;
+                case SKIPPED -> skippedCount++;
+                // PENDING / RUNNING 非终态，不参与三个计数
+                default -> { }
+            }
+        }
+
+        PlanExecutionStatus status;
+        if (successCount == stepExecutions.size()) {
+            // 所有步骤均成功（含单步计划成功、空计划——没有失败与跳过）
+            status = PlanExecutionStatus.SUCCESS;
+        } else if (successCount > 0) {
+            // 有成功步骤，同时存在失败或跳过步骤
+            status = PlanExecutionStatus.PARTIAL_SUCCESS;
+        } else {
+            // 没有任何成功步骤（全部 FAILED / SKIPPED / 未执行）
+            status = PlanExecutionStatus.FAILED;
+        }
+
+        return new PlanExecutionSummary(
+                status,
+                stepExecutions.size(),
+                successCount,
+                failedCount,
+                skippedCount
+        );
     }
 
     /**

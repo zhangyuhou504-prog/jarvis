@@ -82,11 +82,13 @@ class ExecutionContextTest {
         ExecutionContext context = new ExecutionContext(planResult);
 
         context.markRunning("step_2");
-        context.markFailed("step_2");
+        context.markFailed("step_2", "multiply 工具执行异常");
 
         StepExecution failed = context.getStepExecution("step_2");
         assertEquals(StepExecutionStatus.FAILED, failed.status());
         assertNull(failed.result());
+        // 8.6.1：FAILED 有 error 无 result
+        assertEquals("multiply 工具执行异常", failed.error());
     }
 
     @Test
@@ -113,7 +115,7 @@ class ExecutionContextTest {
     @Test
     void shouldRejectPendingToFailed() {
         ExecutionContext context = new ExecutionContext(planResult);
-        assertThrows(IllegalStateException.class, () -> context.markFailed("step_1"));
+        assertThrows(IllegalStateException.class, () -> context.markFailed("step_1", "原因"));
     }
 
     @Test
@@ -131,7 +133,7 @@ class ExecutionContextTest {
         context.markSuccess("step_1", 1);
         // SUCCESS 是终态：不能再 RUNNING / FAILED
         assertThrows(IllegalStateException.class, () -> context.markRunning("step_1"));
-        assertThrows(IllegalStateException.class, () -> context.markFailed("step_1"));
+        assertThrows(IllegalStateException.class, () -> context.markFailed("step_1", "原因"));
     }
 
     @Test
@@ -182,21 +184,23 @@ class ExecutionContextTest {
     void failedDependencyShouldNotBeSatisfied() {
         ExecutionContext context = new ExecutionContext(planResult);
         context.markRunning("step_1");
-        context.markFailed("step_1");
+        context.markFailed("step_1", "查询订单失败");
         // 依赖失败 ≠ 满足
         assertTrue(!context.areDependenciesSatisfied("step_3"));
     }
 
-    // ---- SKIPPED（8.4.2：依赖失败被跳过）----
+    // ---- SKIPPED（8.4.2：依赖失败被跳过；8.6.1：记录跳过原因）----
 
     @Test
     void shouldSkipPendingStep() {
         // PENDING → SKIPPED：合法（外部原因跳过，从未启动）
         ExecutionContext context = new ExecutionContext(planResult);
-        context.markSkipped("step_1");
+        context.markSkipped("step_1", "前置依赖步骤未成功: step_0");
         StepExecution skipped = context.getStepExecution("step_1");
         assertEquals(StepExecutionStatus.SKIPPED, skipped.status());
         assertNull(skipped.result());
+        // 8.6.1：SKIPPED 的 error 承载跳过原因
+        assertEquals("前置依赖步骤未成功: step_0", skipped.error());
     }
 
     @Test
@@ -204,25 +208,109 @@ class ExecutionContextTest {
         // RUNNING / 终态不能再 SKIPPED（已启动的步骤不存在"跳过"语义）
         ExecutionContext context = new ExecutionContext(planResult);
         context.markRunning("step_1");
-        assertThrows(IllegalStateException.class, () -> context.markSkipped("step_1"));
+        assertThrows(IllegalStateException.class, () -> context.markSkipped("step_1", "原因"));
 
         ExecutionContext context2 = new ExecutionContext(planResult);
         context2.markRunning("step_1");
         context2.markSuccess("step_1", 1);
-        assertThrows(IllegalStateException.class, () -> context2.markSkipped("step_1"));
+        assertThrows(IllegalStateException.class, () -> context2.markSkipped("step_1", "原因"));
     }
 
     @Test
     void skippedDependencyShouldNotBeSatisfied() {
         // 级联核心：SKIPPED ≠ SUCCESS——依赖链下游同样不满足
         ExecutionContext context = new ExecutionContext(planResult);
-        context.markSkipped("step_1");
+        context.markSkipped("step_1", "前置依赖步骤未成功");
         assertTrue(!context.areDependenciesSatisfied("step_3"));
     }
 
     @Test
     void shouldRejectUnknownStepIdOnSkip() {
         ExecutionContext context = new ExecutionContext(planResult);
-        assertThrows(IllegalArgumentException.class, () -> context.markSkipped("step_99"));
+        assertThrows(IllegalArgumentException.class, () -> context.markSkipped("step_99", "原因"));
+    }
+
+    // ---- 8.6.2 执行结果汇总（summarize） ----
+
+    @Test
+    void allSuccessShouldSummarizeAsSuccess() {
+        ExecutionContext context = new ExecutionContext(planResult);
+        successAll(context);
+
+        PlanExecutionSummary summary = context.summarize();
+
+        assertEquals(PlanExecutionStatus.SUCCESS, summary.status());
+        assertEquals(4, summary.totalSteps());
+        assertEquals(4, summary.successCount());
+        assertEquals(0, summary.failedCount());
+        assertEquals(0, summary.skippedCount());
+    }
+
+    @Test
+    void mixedResultShouldSummarizeAsPartialSuccess() {
+        // 你设计文档的场景：step_1 SUCCESS、step_2 FAILED、step_3 SKIPPED、step_4 SUCCESS
+        // （summarize 只读终态、不校验依赖语义——本场景按状态机合法路径直接构造）
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");
+        context.markSuccess("step_1", null);
+        context.markRunning("step_2");
+        context.markFailed("step_2", "失败原因");
+        context.markSkipped("step_3", "前置依赖步骤未成功");
+        context.markRunning("step_4");
+        context.markSuccess("step_4", null);
+
+        PlanExecutionSummary summary = context.summarize();
+
+        assertEquals(PlanExecutionStatus.PARTIAL_SUCCESS, summary.status());
+        assertEquals(4, summary.totalSteps());
+        assertEquals(2, summary.successCount());
+        assertEquals(1, summary.failedCount());
+        assertEquals(1, summary.skippedCount());
+    }
+
+    @Test
+    void noSuccessShouldSummarizeAsFailed() {
+        // 零成功：一个 FAILED + 其余 SKIPPED（失败级联的真实形态）
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");
+        context.markFailed("step_1", "模型调用失败");
+        context.markSkipped("step_2", "前置依赖步骤未成功");
+        context.markSkipped("step_3", "前置依赖步骤未成功");
+        context.markSkipped("step_4", "前置依赖步骤未成功");
+
+        PlanExecutionSummary summary = context.summarize();
+
+        assertEquals(PlanExecutionStatus.FAILED, summary.status());
+        assertEquals(0, summary.successCount());
+        assertEquals(1, summary.failedCount());
+        assertEquals(3, summary.skippedCount());
+    }
+
+    @Test
+    void pendingRunningShouldNotCountInThreeCounters() {
+        // 执行中途调用 summarize：PENDING/RUNNING 非终态，不进三个计数
+        // （totalSteps 仍是全部步骤数——口径文档已约定）
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");   // RUNNING：不计入
+        // step_2/step_3/step_4 保持 PENDING：不计入
+
+        PlanExecutionSummary summary = context.summarize();
+
+        assertEquals(4, summary.totalSteps());
+        assertEquals(0, summary.successCount());
+        assertEquals(0, summary.failedCount());
+        assertEquals(0, summary.skippedCount());
+        // 零成功 → FAILED（中途调用的口径，常规用法是执行结束后再汇总）
+        assertEquals(PlanExecutionStatus.FAILED, summary.status());
+    }
+
+    /**
+     * 便捷：把全部步骤标记为 SUCCESS（无产出）。
+     */
+    private void successAll(ExecutionContext context) {
+        for (String stepId : List.of("step_1", "step_2", "step_3", "step_4")) {
+            context.markRunning(stepId);
+            context.markSuccess(stepId, null);
+        }
     }
 }
