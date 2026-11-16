@@ -66,7 +66,10 @@ public class PlanScheduler {
 
         // 1) 入度表：初始入度 = dependsOn 的数量（尚未解除的前置依赖个数）
         //    例：step_4 dependsOn [step_2, step_3] → 初始入度 2
-        Map<String, Integer> inDegree = new HashMap<>();
+        //    LinkedHashMap（插入序 = 计划原始顺序）：无依赖步骤的初始入队顺序
+        //    确定（按计划书写顺序），否则 HashMap 乱序会导致"同批无依赖步骤"
+        //    每次排序结果不同——ExecutionContext 按执行顺序展示状态需要确定性
+        Map<String, Integer> inDegree = new java.util.LinkedHashMap<>();
         for (PlanStep step : plan.steps()) {
             inDegree.put(step.stepId(), step.dependsOn().size());
         }

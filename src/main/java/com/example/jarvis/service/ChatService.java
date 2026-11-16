@@ -281,7 +281,8 @@ public class ChatService {
         ArrayNode messages = buildMessages(resolveSystemPrompt(request), history, request.getMessage());
 
         // 工具闭环（内部多轮非流式调用，直到模型给出最终答案）
-        String answer = toolLoopService.run(client, messages);
+        ToolLoopResult loopResult = toolLoopService.run(client, messages);
+        String answer = loopResult.answer();
         log.info("工具对话完成, 答案长度={}", answer.length());
 
         // 成功完成时写入会话（与流式链路一致：只保存完整问答对）

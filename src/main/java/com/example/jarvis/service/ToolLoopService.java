@@ -13,6 +13,8 @@ import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * 工具调用闭环：请求模型 → 若返回 tool_calls 则执行并把结果回传 → 再次请求 →
@@ -64,19 +66,35 @@ public class ToolLoopService {
     }
 
     /**
-     * 执行工具调用闭环，返回模型最终文本答案。
+     * 执行工具调用闭环，返回最终文本答案与成败标志。
      *
      * <p>工具定义（{@code tools} 字段）来自 {@link ToolRegistry}，与 {@link ToolExecutor}
      * 的执行白名单是同一份注册表——模型只能调用注册过的工具。</p>
      *
+     * <p><b>成败判定（8.4.3.3 恢复模式）</b>：判据是
+     * "最终是否存在未恢复的工具失败"，不是异常计数——中途失败但被模型恢复
+     * 不算失败。具体规则：调用失败按工具名记录；同名工具再次调用成功即清除；
+     * 模型停止调用工具时记录为空则 success=true。以工具名作恢复匹配是第一版
+     * 简化规则，不识别"改用其他方式绕过"等复杂恢复场景。</p>
+     *
      * @param client   已解析的模型客户端
      * @param messages 初始消息数组（system + 历史 + 当前 user），方法内部会拷贝，不修改入参
-     * @return 模型最终文本答案
+     * @return 最终文本答案 + 本次闭环是否成功完成
      * @throws IllegalStateException 工具调用轮数达到上限时模型仍在请求工具
      */
-    public String run(LlmClientFactory.ResolvedLlmClient client, ArrayNode messages) {
+    public ToolLoopResult run(LlmClientFactory.ResolvedLlmClient client, ArrayNode messages) {
         ArrayNode working = (ArrayNode) messages.deepCopy();
         int toolRounds = 0;
+        // 8.4.3.3 恢复模式局部状态：工具名 → 未恢复失败计数。
+        // 规则（第一版，按工具名计数抵消）：
+        //   1. 工具调用失败 → 计数 +1
+        //   2. 同名工具后续调用成功 → 计数 -1（抵消一次；减到 0 移除记录）
+        //   3. 模型停止调用工具时 → 计数全部归零（Map 为空）→ success=true
+        // 边界修正：同一轮两次失败、下一轮一次成功时，Set.remove 会把两笔失败
+        // 一起抹掉（一次成功错误抵消多次失败）；计数保证每次成功最多抵一次同名失败。
+        // 简化说明：按工具名匹配仍无法确认成功调用在业务上真的修复了之前的失败，
+        // 属第一版可接受的限制，不引入更复杂的恢复机制
+        Map<String, Integer> unresolvedFailures = new HashMap<>();
         while (true) {
             ObjectNode request = buildRequest(client, working);
             JsonNode response = llmClientService.chat(client, request)
@@ -88,8 +106,10 @@ public class ToolLoopService {
             // 无 tool_calls → 最终答案
             if (!toolCalls.isArray() || toolCalls.size() == 0) {
                 String content = message.path("content").asText("");
-                log.info("工具循环结束: 共执行 {} 轮工具调用, 最终答案长度={}", toolRounds, content.length());
-                return content;
+                log.info("工具循环结束: 共执行 {} 轮工具调用, 最终答案长度={}, 未恢复失败工具={}",
+                        toolRounds, content.length(), unresolvedFailures);
+                // 恢复模式判定：最终是否存在未恢复的工具失败
+                return new ToolLoopResult(content, unresolvedFailures.isEmpty());
             }
 
             // 达到轮数上限仍请求工具 → 终止，防止无限循环
@@ -112,9 +132,14 @@ public class ToolLoopService {
                 String result;
                 try {
                     result = toolExecutor.execute(name, arguments);
+                    // 同名工具执行成功 → 失败计数 -1（抵消一次，减到 0 移除记录，恢复规则 2）
+                    unresolvedFailures.computeIfPresent(name, (key, count) ->
+                            count <= 1 ? null : count - 1);
                     log.info("工具调用[第{}轮]: name={}, args={}, result={}", toolRounds + 1, name, arguments, result);
                 } catch (Exception e) {
                     // 工具失败不中断循环：把失败原因回传给模型，由模型决定如何回答
+                    // 同时失败计数 +1（恢复规则 1）
+                    unresolvedFailures.merge(name, 1, Integer::sum);
                     result = "工具执行失败: " + e.getMessage();
                     log.error("工具执行失败: name={}, args={}", name, arguments, e);
                 }

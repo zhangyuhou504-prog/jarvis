@@ -96,7 +96,7 @@ class ChatServiceStrategyRoutingTest {
                 "http://localhost", WebClient.create());
         when(llmClientFactory.getClient(anyString())).thenReturn(client);
         when(modelRouter.route(any(), any())).thenReturn("mxbc-qwen");
-        when(toolLoopService.run(any(), any())).thenReturn("工具回答");
+        when(toolLoopService.run(any(), any())).thenReturn(new ToolLoopResult("工具回答", true));
 
         ChatResponse response = chatService.chatWithTools(requestOf("什么是 Redis？", "conv-1"));
 
@@ -144,7 +144,7 @@ class ChatServiceStrategyRoutingTest {
                 "http://localhost", WebClient.create());
         when(llmClientFactory.getClient(anyString())).thenReturn(client);
         when(modelRouter.route(any(), any())).thenReturn("mxbc-qwen");
-        when(toolLoopService.run(any(), any())).thenReturn("回答");
+        when(toolLoopService.run(any(), any())).thenReturn(new ToolLoopResult("回答", true));
 
         chatService.chatWithTools(requestOf("接着说", "conv-42"));
 
@@ -172,7 +172,7 @@ class ChatServiceStrategyRoutingTest {
                 "http://localhost", WebClient.create());
         when(llmClientFactory.getClient(anyString())).thenReturn(client);
         when(modelRouter.route(any(), any())).thenReturn("mxbc-qwen");
-        when(toolLoopService.run(any(), any())).thenReturn("回答");
+        when(toolLoopService.run(any(), any())).thenReturn(new ToolLoopResult("回答", true));
 
         chatService.chatWithTools(requestOf("你好", null));
 
