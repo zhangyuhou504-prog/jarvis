@@ -38,7 +38,38 @@ class PlanValidatorTest {
     @Test
     void shouldPassForEmptySteps() {
         Plan plan = new Plan("目标", List.of());
+        // 各单项检查在空集上仍通过（历史口径不变）；
+        // 空计划由 validateNotEmpty / 总入口统一拦截
         assertDoesNotThrow(() -> validator.validateUniqueStepIds(plan));
+    }
+
+    // ---- validateNotEmpty（8.6.3.2 实测补：空计划拦截） ----
+
+    @Test
+    void shouldRejectEmptyPlanInNotEmptyCheck() {
+        // 模型偶发返回 steps: [] ——空集上唯一性/引用/环检测天然全过，
+        // 必须显式拦截，否则给用户输出"全部成功但 0 步骤"的误导报告
+        Plan plan = new Plan("目标", List.of());
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> validator.validateNotEmpty(plan));
+        assertTrue(ex.getMessage().contains("steps 为空"));
+    }
+
+    @Test
+    void shouldPassNotEmptyCheckWithSteps() {
+        Plan plan = new Plan("目标", List.of(
+                new PlanStep("step_1", "步骤一", List.of())
+        ));
+        assertDoesNotThrow(() -> validator.validateNotEmpty(plan));
+    }
+
+    @Test
+    void validateShouldRejectEmptyPlanAsWhole() {
+        // 总入口：空计划在第一项就被拦截（触发 Planner 带原因重试）
+        Plan plan = new Plan("目标", List.of());
+        assertThrows(IllegalArgumentException.class, () -> validator.validate(plan));
     }
 
     // ---- validateDependenciesExist ----

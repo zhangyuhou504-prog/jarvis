@@ -20,8 +20,9 @@ import java.util.stream.Collectors;
  * （有向无环图）——Planner 生成依赖图，PlanValidator 保证图合法，
  * PlanExecutor 按图执行。</p>
  *
- * <p><b>校验项与职责边界（第七阶段 7.4）</b>：</p>
+ * <p><b>校验项与职责边界（第七阶段 7.4 + 8.6.3.2 补空计划检查）</b>：</p>
  * <ol>
+ *   <li>{@link #validateNotEmpty(Plan)}：计划非空（steps 至少一步）</li>
  *   <li>{@link #validateUniqueStepIds(Plan)}：stepId 唯一性（两个 step 都叫 step_1）</li>
  *   <li>{@link #validateDependenciesExist(Plan)}：dependsOn 指向的步骤是否存在
  *       （step_1 依赖 step_99）。<b>自依赖不属于本项职责</b>——stepId 存在，
@@ -29,14 +30,14 @@ import java.util.stream.Collectors;
  *   <li>{@link #validateNoCycles(Plan)}：循环依赖检测，DFS 三态标记（含自依赖）</li>
  * </ol>
  *
- * <p>统一入口 {@link #validate(Plan)} 按序执行三项检查——
+ * <p>统一入口 {@link #validate(Plan)} 按序执行四项检查——
  * 环检测依赖"引用都存在"的前提，顺序不能乱。</p>
  */
 @Component
 public class PlanValidator {
 
     /**
-     * 校验计划合法性（总入口）：按序执行三项检查，任一失败立即抛出。
+     * 校验计划合法性（总入口）：按序执行四项检查，任一失败立即抛出。
      *
      * <p>顺序有依赖关系：引用检查必须在环检测之前，
      * 否则环检测中 {@code stepMap.get(dep)} 为 null 会抛 NPE 而非友好异常。</p>
@@ -45,9 +46,30 @@ public class PlanValidator {
      * @throws IllegalArgumentException 任一检查失败（消息指明具体原因）
      */
     public void validate(Plan plan) {
+        validateNotEmpty(plan);
         validateUniqueStepIds(plan);
         validateDependenciesExist(plan);
         validateNoCycles(plan);
+    }
+
+    /**
+     * 校验计划非空：steps 至少一个步骤。
+     *
+     * <p><b>为什么需要（8.6.3.2 实测发现）</b>：模型偶发返回
+     * {@code steps: []} 空计划——空集上唯一性/引用/环检测天然全过，
+     * 空计划会一路绿灯放行，最终给用户输出"全部成功但 0 步骤"的
+     * 误导报告。计划至少要有一步才能执行；空计划在此拦截并触发
+     * Planner 带原因重试（错误信息进入重试的修正指令）。</p>
+     *
+     * @param plan 待校验的计划
+     * @throws IllegalArgumentException steps 为空
+     */
+    public void validateNotEmpty(Plan plan) {
+        if (plan.steps().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "计划 steps 为空：至少需要一个步骤才能执行，请检查模型输出"
+            );
+        }
     }
 
     /**

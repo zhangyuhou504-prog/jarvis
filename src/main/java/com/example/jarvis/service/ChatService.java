@@ -2,6 +2,7 @@ package com.example.jarvis.service;
 
 import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.domain.Conversation;
+import com.example.jarvis.config.PlanProperties;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.execution.ExecutionContext;
@@ -63,6 +64,8 @@ public class ChatService {
     private final PlanOrchestrationService planOrchestrationService;
     private final PlanExecutor planExecutor;
     private final PlanExecutionReportBuilder planExecutionReportBuilder;
+    private final FinalAnswerService finalAnswerService;
+    private final PlanProperties planProperties;
 
     /**
      * 用于解析 SSE chunk 的共享 JSON 解析器（线程安全）。
@@ -224,9 +227,11 @@ public class ChatService {
      * <ul>
      *   <li>{@code DIRECT}：原有链路（模型路由 → {@link ToolLoopService} 工具闭环）</li>
      *   <li>{@code PLANNED}：规划执行链路（{@link PlanOrchestrationService} 生成计划
-     *       → {@link PlanExecutor} 逐步骤执行 → {@link PlanExecutionReportBuilder}
-     *       组装执行报告 → 以报告文本作为回答返回）。计划生成失败异常上抛
-     *       不降级；部分步骤失败不影响报告生成（失败详情在报告内向用户解释）</li>
+     *       → {@link PlanExecutor} 逐步骤执行 → 内部执行报告 →
+     *       {@link FinalAnswerService} 整理为面向用户的自然语言回答）。
+     *       计划生成与答案整理失败均异常上抛不降级不伪装；部分步骤失败由
+     *       答案整理如实向用户说明（成功与失败部分）；会话只保存最终答案，
+     *       不保存内部执行报告</li>
      * </ul>
      *
      * <p>两条路径对会话保存同口径：只保存完整的用户问题与最终回答。
@@ -262,9 +267,10 @@ public class ChatService {
                 request.getConversationId(), strategyResult.strategy(), strategyResult.reason());
 
         if (strategyResult.strategy() == ExecutionStrategy.PLANNED) {
-            // ---------- 8.6.3.2 PLANNED：规划执行路径 ----------
+            // ---------- 8.6.3.2 + 8.6.5 PLANNED：规划执行 → 答案整理 ----------
             // Planner → Validator → Scheduler（createPlan 内完成）
-            // → Executor（逐步骤工具闭环，失败级联跳过）→ ReportBuilder → 回复
+            // → Executor（逐步骤工具闭环，失败级联跳过）→ ReportBuilder（内部报告）
+            // → FinalAnswerService（报告 → 面向用户的自然语言回答）
             // 1. 生成计划并完成校验与拓扑排序。
             //    计划生成失败（模型无返回/JSON 非法/语义不合法/重试耗尽）异常直接
             //    向上抛出，不静默降级为 DIRECT——把规划任务当普通对话执行会
@@ -273,13 +279,24 @@ public class ChatService {
 
             // 2. 执行计划。PlanExecutor 对单步失败 markFailed 后 continue
             //    （下游级联 SKIPPED、无关步骤照常执行），永远正常返回
-            //    ExecutionContext——部分步骤失败不影响报告生成
+            //    ExecutionContext——部分步骤失败不影响后续报告与答案生成
             ExecutionContext context = planExecutor.execute(planResult);
 
-            // 3. 生成执行报告（整体汇总 + 每步状态/结果/原因，均来自执行上下文）
-            String answer = planExecutionReportBuilder.build(context);
+            // 3. 生成内部执行报告（诊断视角：stepId/状态/结果/原因）。
+            //    报告是中间产物：日志留全量供排查"模型转述错误"类问题，
+            //    不直接作为用户回答
+            String report = planExecutionReportBuilder.build(context);
+            log.debug("内部执行报告:\n{}", report);
 
-            // 4. 保存完整问答（与 DIRECT 同口径：只保存完整的用户问题与最终回答）
+            // 4. 整理最终答案（模型收口：报告 → 用户视角的自然语言）。
+            //    生成失败不伪装成功——异常上抛交由全局处理转为服务错误，
+            //    执行记录已在日志/上下文中保留供排查
+            String answer = finalAnswerService.generate(
+                    request.getMessage(), report, planProperties.modelId());
+
+            // 5. 保存完整问答（与 DIRECT 同口径：只保存完整的用户问题与
+            //    最终答案；内部执行报告不进会话——否则下一轮对话会把
+            //    报告当成上一轮对用户的回答）
             if (conversation != null) {
                 appendTurn(conversation, request.getMessage(), answer);
             }

@@ -232,8 +232,9 @@ public class ExecutionContext {
         }
 
         PlanExecutionStatus status;
-        if (successCount == stepExecutions.size()) {
-            // 所有步骤均成功（含单步计划成功、空计划——没有失败与跳过）
+        if (successCount == stepExecutions.size() && successCount > 0) {
+            // 所有步骤均成功（totalSteps > 0 是前提——0 步骤的空计划不算
+            // "全部成功"，8.6.3.2 实测空计划曾在空集上误判 SUCCESS）
             status = PlanExecutionStatus.SUCCESS;
         } else if (successCount > 0) {
             // 有成功步骤，同时存在失败或跳过步骤

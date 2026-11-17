@@ -304,6 +304,20 @@ class ExecutionContextTest {
         assertEquals(PlanExecutionStatus.FAILED, summary.status());
     }
 
+    @Test
+    void emptyPlanShouldSummarizeAsFailedNotSuccess() {
+        // 8.6.3.2 实测发现：空计划（0 步骤）曾在空集上误判
+        // "全部成功"（0==0）——空集不算全部成功，判 FAILED
+        Plan empty = new Plan("空计划", List.of());
+        ExecutionContext context = new ExecutionContext(
+                new PlanResult(empty, new PlanScheduler().topologicalSort(empty)));
+
+        PlanExecutionSummary summary = context.summarize();
+
+        assertEquals(0, summary.totalSteps());
+        assertEquals(PlanExecutionStatus.FAILED, summary.status());
+    }
+
     /**
      * 便捷：把全部步骤标记为 SUCCESS（无产出）。
      */

@@ -1,5 +1,6 @@
 package com.example.jarvis.service;
 
+import com.example.jarvis.config.PlanProperties;
 import com.example.jarvis.dto.ChatRequest;
 import com.example.jarvis.dto.ChatResponse;
 import com.example.jarvis.execution.ExecutionContext;
@@ -66,6 +67,8 @@ class ChatServiceStrategyRoutingTest {
     private PlanOrchestrationService planOrchestrationService;
     private PlanExecutor planExecutor;
     private PlanExecutionReportBuilder planExecutionReportBuilder;
+    private FinalAnswerService finalAnswerService;
+    private PlanProperties planProperties;
     private ChatService chatService;
 
     @BeforeEach
@@ -81,11 +84,14 @@ class ChatServiceStrategyRoutingTest {
         planOrchestrationService = mock(PlanOrchestrationService.class);
         planExecutor = mock(PlanExecutor.class);
         planExecutionReportBuilder = mock(PlanExecutionReportBuilder.class);
+        finalAnswerService = mock(FinalAnswerService.class);
+        planProperties = new PlanProperties("mxbc-qwen");
 
         chatService = new ChatService(chatClient, llmClientFactory, modelRouter,
                 intentService, toolLoopService, strategyResolver,
                 promptTemplateService, conversationService,
-                planOrchestrationService, planExecutor, planExecutionReportBuilder);
+                planOrchestrationService, planExecutor, planExecutionReportBuilder,
+                finalAnswerService, planProperties);
         ReflectionTestUtils.setField(chatService, "intentEnabled", true);
         // 历史快照上限（默认 @Value 注入在生产环境生效，单测需手动设值）
         ReflectionTestUtils.setField(chatService, "maxHistoryMessages", 20);
@@ -122,11 +128,12 @@ class ChatServiceStrategyRoutingTest {
         verify(strategyResolver, times(1)).resolve(any());
     }
 
-    // ---- 场景 3/4：策略 PLANNED → 规划执行链路（8.6.3.2）----
+    // ---- 场景 3/4：策略 PLANNED → 规划执行链路（8.6.3.2 + 8.6.5）----
 
     @Test
-    void plannedStrategyShouldExecutePlanAndReturnReport() {
-        // PLANNED 全链路：createPlan → execute → 报告作为回答，不碰 DIRECT 的路由/工具闭环
+    void plannedStrategyShouldExecutePlanAndReturnFinalAnswer() {
+        // PLANNED 全链路：createPlan → execute → 内部报告 → FinalAnswerService
+        // 返回自然语言答案（不是内部报告），不碰 DIRECT 的路由/工具闭环
         when(intentService.recognize(anyString()))
                 .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
         when(strategyResolver.resolve(any()))
@@ -147,14 +154,19 @@ class ChatServiceStrategyRoutingTest {
         context.markSuccess("step_2", "65536");
         when(planExecutor.execute(planResult)).thenReturn(context);
         when(planExecutionReportBuilder.build(context)).thenReturn("任务执行报告\n整体状态：全部成功");
+        when(finalAnswerService.generate("计算 128×256 然后乘以 2",
+                "任务执行报告\n整体状态：全部成功", "mxbc-qwen"))
+                .thenReturn("128 × 256 = 32768，再乘以 2，最终结果是 65536。");
 
         ChatResponse response = chatService.chatWithTools(requestOf("计算 128×256 然后乘以 2", null));
 
-        assertEquals("任务执行报告\n整体状态：全部成功", response.getAnswer());
-        // 规划链路各环节恰好一次
+        assertEquals("128 × 256 = 32768，再乘以 2，最终结果是 65536。", response.getAnswer());
+        // 规划链路各环节恰好一次（含答案整理，modelId 来自 PlanProperties 配置）
         verify(planOrchestrationService, times(1)).createPlan("计算 128×256 然后乘以 2");
         verify(planExecutor, times(1)).execute(planResult);
         verify(planExecutionReportBuilder, times(1)).build(context);
+        verify(finalAnswerService, times(1)).generate(
+                "计算 128×256 然后乘以 2", "任务执行报告\n整体状态：全部成功", "mxbc-qwen");
         // PLANNED 绝不走 DIRECT 链路（模型路由 / 工具闭环零调用）
         verify(modelRouter, never()).route(any(), any());
         verify(toolLoopService, never()).run(any(), any());
@@ -176,12 +188,38 @@ class ChatServiceStrategyRoutingTest {
         // 生成失败后不执行任何后续环节
         verify(planExecutor, never()).execute(any());
         verify(planExecutionReportBuilder, never()).build(any());
+        verify(finalAnswerService, never()).generate(any(), any(), any());
         verify(toolLoopService, never()).run(any(), any());
     }
 
     @Test
-    void plannedPathShouldSaveTurnWhenConversationExists() {
-        // PLANNED 与 DIRECT 同口径：conversation 存在时保存完整问答
+    void plannedPathShouldPropagateFinalAnswerFailure() {
+        // 8.6.5：最终答案整理失败 → 异常上抛不伪装成功（执行记录已在日志/上下文保留）
+        when(intentService.recognize(anyString()))
+                .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
+        when(strategyResolver.resolve(any()))
+                .thenReturn(new StrategyResult(ExecutionStrategy.PLANNED, "多步骤依赖"));
+
+        Plan plan = new Plan("单步", List.of(new PlanStep("step_1", "唯一步骤", List.of())));
+        PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
+        when(planOrchestrationService.createPlan(anyString())).thenReturn(planResult);
+
+        ExecutionContext context = new ExecutionContext(planResult);
+        context.markRunning("step_1");
+        context.markSuccess("step_1", "结果");
+        when(planExecutor.execute(planResult)).thenReturn(context);
+        when(planExecutionReportBuilder.build(context)).thenReturn("报告");
+        when(finalAnswerService.generate(any(), any(), any()))
+                .thenThrow(new IllegalStateException("FinalAnswer 模型没有返回有效内容"));
+
+        assertThrows(IllegalStateException.class,
+                () -> chatService.chatWithTools(requestOf("帮我做点什么", null)));
+    }
+
+    @Test
+    void plannedPathShouldSaveFinalAnswerNotReportInConversation() {
+        // 8.6.5：会话保存最终答案（不是内部执行报告）——
+        // 否则下一轮对话会把报告当成上一轮对用户的回答
         when(intentService.recognize(anyString()))
                 .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
         when(strategyResolver.resolve(any()))
@@ -199,14 +237,15 @@ class ChatServiceStrategyRoutingTest {
         context.markRunning("step_1");
         context.markSuccess("step_1", "完成");
         when(planExecutor.execute(planResult)).thenReturn(context);
-        when(planExecutionReportBuilder.build(context)).thenReturn("报告");
+        when(planExecutionReportBuilder.build(context)).thenReturn("内部执行报告：[step_1] SUCCESS ...");
+        when(finalAnswerService.generate(any(), any(), any())).thenReturn("好的，已经完成了。");
 
         chatService.chatWithTools(requestOf("帮我规划并执行", "conv-7"));
 
-        // 问答对完整写入（user = 用户消息，assistant = 报告）
+        // 问答对完整写入：user = 用户消息，assistant = 最终答案（非内部报告）
         assertEquals(2, conversation.getMessages().size());
         assertEquals("帮我规划并执行", conversation.getMessages().get(0).getContent());
-        assertEquals("报告", conversation.getMessages().get(1).getContent());
+        assertEquals("好的，已经完成了。", conversation.getMessages().get(1).getContent());
     }
 
     // ---- 场景 5：Java 规则命中 → 不调用小模型（StrategyResolver 内部已验证，
