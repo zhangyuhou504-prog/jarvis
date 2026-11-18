@@ -144,7 +144,8 @@ class ChatServiceStrategyRoutingTest {
                 new PlanStep("step_2", "将上一步结果乘以 2", List.of("step_1"))
         ));
         PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
-        when(planOrchestrationService.createPlan("计算 128×256 然后乘以 2"))
+        // 单轮对话（conversationId=null）→ history 为空列表；两参签名与生产代码一致
+        when(planOrchestrationService.createPlan("计算 128×256 然后乘以 2", List.of()))
                 .thenReturn(planResult);
 
         ExecutionContext context = new ExecutionContext(planResult);
@@ -162,7 +163,7 @@ class ChatServiceStrategyRoutingTest {
 
         assertEquals("128 × 256 = 32768，再乘以 2，最终结果是 65536。", response.getAnswer());
         // 规划链路各环节恰好一次（含答案整理，modelId 来自 PlanProperties 配置）
-        verify(planOrchestrationService, times(1)).createPlan("计算 128×256 然后乘以 2");
+        verify(planOrchestrationService, times(1)).createPlan("计算 128×256 然后乘以 2", List.of());
         verify(planExecutor, times(1)).execute(planResult);
         verify(planExecutionReportBuilder, times(1)).build(context);
         verify(finalAnswerService, times(1)).generate(
@@ -179,7 +180,7 @@ class ChatServiceStrategyRoutingTest {
                 .thenReturn(new IntentResult(IntentType.DATA_QUERY, 0.9, "测试"));
         when(strategyResolver.resolve(any()))
                 .thenReturn(new StrategyResult(ExecutionStrategy.PLANNED, "多步骤依赖"));
-        when(planOrchestrationService.createPlan(anyString()))
+        when(planOrchestrationService.createPlan(anyString(), any()))
                 .thenThrow(new IllegalStateException("计划生成失败：模型无返回"));
 
         assertThrows(IllegalStateException.class,
@@ -202,7 +203,7 @@ class ChatServiceStrategyRoutingTest {
 
         Plan plan = new Plan("单步", List.of(new PlanStep("step_1", "唯一步骤", List.of())));
         PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
-        when(planOrchestrationService.createPlan(anyString())).thenReturn(planResult);
+        when(planOrchestrationService.createPlan(anyString(), any())).thenReturn(planResult);
 
         ExecutionContext context = new ExecutionContext(planResult);
         context.markRunning("step_1");
@@ -231,7 +232,7 @@ class ChatServiceStrategyRoutingTest {
 
         Plan plan = new Plan("单步", List.of(new PlanStep("step_1", "唯一步骤", List.of())));
         PlanResult planResult = new PlanResult(plan, new PlanScheduler().topologicalSort(plan));
-        when(planOrchestrationService.createPlan(anyString())).thenReturn(planResult);
+        when(planOrchestrationService.createPlan(anyString(), any())).thenReturn(planResult);
 
         ExecutionContext context = new ExecutionContext(planResult);
         context.markRunning("step_1");

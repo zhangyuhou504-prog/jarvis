@@ -1,5 +1,6 @@
 package com.example.jarvis.plan;
 
+import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.infrastructure.llm.LlmClientService;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,11 +18,16 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
  * PlannerService 单元测试：mock 模型响应，验证"content → Plan"解析链路
  * （不依赖真实模型，真实拆解质量由联调验证）。
+ *
+ * <p>8.6.5 后 history 作为独立参数传入（多轮指代上下文），单测验证
+ * 历史消息在模型请求中的组装顺序：system → 历史 → 当前用户任务。</p>
  */
 class PlannerServiceTest {
 
@@ -80,7 +86,7 @@ class PlannerServiceTest {
                 }
                 """);
 
-        Plan plan = plannerService.createPlan("帮我计算 128 × 256，然后把结果乘以 2");
+        Plan plan = plannerService.createPlan("帮我计算 128 × 256，然后把结果乘以 2", List.of());
 
         assertEquals("计算最终结果", plan.goal());
         assertEquals(2, plan.steps().size());
@@ -98,20 +104,22 @@ class PlannerServiceTest {
                 ```
                 """);
 
-        Plan plan = plannerService.createPlan("目标");
+        Plan plan = plannerService.createPlan("目标", List.of());
         assertEquals(1, plan.steps().size());
     }
 
     @Test
     void shouldThrowOnInvalidJson() {
         mockModelContent("这不是 JSON，模型跑偏了");
-        assertThrows(IllegalStateException.class, () -> plannerService.createPlan("目标"));
+        assertThrows(IllegalStateException.class,
+                () -> plannerService.createPlan("目标", List.of()));
     }
 
     @Test
     void shouldThrowOnBlankContent() {
         mockModelContent("   ");
-        assertThrows(IllegalStateException.class, () -> plannerService.createPlan("目标"));
+        assertThrows(IllegalStateException.class,
+                () -> plannerService.createPlan("目标", List.of()));
     }
 
     @Test
@@ -127,7 +135,8 @@ class PlannerServiceTest {
                 }
                 """);
 
-        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+        assertThrows(IllegalArgumentException.class,
+                () -> plannerService.createPlan("目标", List.of()));
     }
 
     @Test
@@ -142,7 +151,8 @@ class PlannerServiceTest {
                 }
                 """);
 
-        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+        assertThrows(IllegalArgumentException.class,
+                () -> plannerService.createPlan("目标", List.of()));
     }
 
     @Test
@@ -158,7 +168,8 @@ class PlannerServiceTest {
                 }
                 """);
 
-        assertThrows(IllegalArgumentException.class, () -> plannerService.createPlan("目标"));
+        assertThrows(IllegalArgumentException.class,
+                () -> plannerService.createPlan("目标", List.of()));
     }
 
     // ---- 重试机制 ----
@@ -172,7 +183,7 @@ class PlannerServiceTest {
                         {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
                         """)));
 
-        Plan plan = plannerService.createPlan("目标");
+        Plan plan = plannerService.createPlan("目标", List.of());
         assertEquals(1, plan.steps().size());
 
         org.mockito.ArgumentCaptor<ObjectNode> captor = org.mockito.ArgumentCaptor.forClass(ObjectNode.class);
@@ -181,7 +192,10 @@ class PlannerServiceTest {
         String secondUserMsg = captor.getAllValues().get(1)
                 .path("messages").get(1).path("content").asText();
         assertTrue(secondUserMsg.contains("修正指令"));
-        assertTrue(secondUserMsg.contains("格式不正确"));
+        // 8.6.5 实测改进：JSON 语法错误的修正指令携带 Jackson 精确诊断（行列号），
+        // 不再是笼统的"格式不正确"——模型能定向修复
+        assertTrue(secondUserMsg.contains("JSON 不合法"));
+        assertTrue(secondUserMsg.contains("计划 JSON"));
     }
 
     @Test
@@ -199,9 +213,9 @@ class PlannerServiceTest {
 
         IllegalArgumentException ex = assertThrows(
                 IllegalArgumentException.class,
-                () -> plannerService.createPlan("目标"));
+                () -> plannerService.createPlan("目标", List.of()));
         assertTrue(ex.getMessage().contains("循环依赖"));
-        org.mockito.Mockito.verify(llmClientService, org.mockito.Mockito.times(2)).chat(any(), any());
+        verify(llmClientService, times(2)).chat(any(), any());
     }
 
     @Test
@@ -210,8 +224,57 @@ class PlannerServiceTest {
                 {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
                 """);
 
-        plannerService.createPlan("目标");
+        plannerService.createPlan("目标", List.of());
         // 一次成功不应触发重试
-        org.mockito.Mockito.verify(llmClientService, org.mockito.Mockito.times(1)).chat(any(), any());
+        verify(llmClientService, times(1)).chat(any(), any());
+    }
+
+    // ---- 会话历史组装（多轮指代改造）----
+
+    @Test
+    void shouldPlaceHistoryBeforeCurrentUserTask() {
+        // 消息组装顺序：system → 历史消息（原样保留角色）→ 当前用户任务。
+        // 历史在前的意义：模型读到本轮指代（"把结果乘以 2"）时上下文已就位
+        List<ChatMessage> history = List.of(
+                new ChatMessage("user", "帮我计算 128 × 256"),
+                new ChatMessage("assistant", "128 × 256 = 32768")
+        );
+        mockModelContent("""
+                {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
+                """);
+
+        plannerService.createPlan("把结果乘以 2", history);
+
+        org.mockito.ArgumentCaptor<ObjectNode> captor = org.mockito.ArgumentCaptor.forClass(ObjectNode.class);
+        verify(llmClientService, times(1)).chat(any(), captor.capture());
+        var messages = captor.getValue().path("messages");
+        // system(0) → 历史 user(1) → 历史 assistant(2) → 当前任务(3)
+        assertEquals(4, messages.size());
+        assertEquals("system", messages.get(0).path("role").asText());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("帮我计算 128 × 256", messages.get(1).path("content").asText());
+        assertEquals("assistant", messages.get(2).path("role").asText());
+        assertEquals("128 × 256 = 32768", messages.get(2).path("content").asText());
+        assertEquals("user", messages.get(3).path("role").asText());
+        assertEquals("把结果乘以 2", messages.get(3).path("content").asText());
+    }
+
+    @Test
+    void shouldHandleNullHistoryAsSingleTurn() {
+        // history 传 null（协调层/调用方未获取到历史）→ 只发 system + 当前任务，不抛 NPE
+        mockModelContent("""
+                {"goal": "目标", "steps": [{"stepId": "step_1", "description": "步骤", "dependsOn": []}]}
+                """);
+
+        plannerService.createPlan("目标", null);
+
+        org.mockito.ArgumentCaptor<ObjectNode> captor = org.mockito.ArgumentCaptor.forClass(ObjectNode.class);
+        verify(llmClientService, times(1)).chat(any(), captor.capture());
+        var messages = captor.getValue().path("messages");
+        // 无历史：system(0) + 当前任务(1)
+        assertEquals(2, messages.size());
+        assertEquals("system", messages.get(0).path("role").asText());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("目标", messages.get(1).path("content").asText());
     }
 }

@@ -272,10 +272,12 @@ public class ChatService {
             // → Executor（逐步骤工具闭环，失败级联跳过）→ ReportBuilder（内部报告）
             // → FinalAnswerService（报告 → 面向用户的自然语言回答）
             // 1. 生成计划并完成校验与拓扑排序。
+            //    history 独立传入（不拼进 goal）：goal 始终只表示本轮任务，
+            //    多轮指代（"接着算上面那个"）由 Planner 层用历史消解。
             //    计划生成失败（模型无返回/JSON 非法/语义不合法/重试耗尽）异常直接
             //    向上抛出，不静默降级为 DIRECT——把规划任务当普通对话执行会
             //    产生看似正常实则错误的结果
-            PlanResult planResult = planOrchestrationService.createPlan(request.getMessage());
+            PlanResult planResult = planOrchestrationService.createPlan(request.getMessage(), history);
 
             // 2. 执行计划。PlanExecutor 对单步失败 markFailed 后 continue
             //    （下游级联 SKIPPED、无关步骤照常执行），永远正常返回
@@ -286,7 +288,7 @@ public class ChatService {
             //    报告是中间产物：日志留全量供排查"模型转述错误"类问题，
             //    不直接作为用户回答
             String report = planExecutionReportBuilder.build(context);
-            log.debug("内部执行报告:\n{}", report);
+            log.info("内部执行报告:\n{}", report);
 
             // 4. 整理最终答案（模型收口：报告 → 用户视角的自然语言）。
             //    生成失败不伪装成功——异常上抛交由全局处理转为服务错误，

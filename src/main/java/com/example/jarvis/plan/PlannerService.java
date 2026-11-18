@@ -1,5 +1,6 @@
 package com.example.jarvis.plan;
 
+import com.example.jarvis.domain.ChatMessage;
 import com.example.jarvis.infrastructure.llm.LlmClientFactory;
 import com.example.jarvis.infrastructure.llm.LlmClientService;
 import jakarta.annotation.PostConstruct;
@@ -17,6 +18,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 
 /**
  * 任务规划服务：把自然语言目标转换成 {@link Plan} 对象。
@@ -27,8 +29,14 @@ import java.time.Duration;
  *
  * <p>模型调用复用 {@link LlmClientService}（统一非流式调用层），
  * 使用默认模型客户端（{@code jarvis.llm.default-model}）；
- * 请求结构为 system（planner-prompt.md）+ user（用户目标）两条消息，
- * 无历史、无 tools。</p>
+ * 请求结构为 system（planner-prompt.md）+ 历史消息（如有）+ user（用户目标）
+ * 三段消息，无 tools。</p>
+ *
+ * <p><b>会话历史（多轮指代改造）</b>：history 作为独立参数传入，组装时放在
+ * 当前用户任务<b>之前</b>——模型读到"接着算上面那个"这类指代时，历史提供了
+ * 指代目标。历史只用于理解上下文，<b>不代表需要重新执行历史任务</b>：
+ * 规划的对象始终只有本轮 goal。截断/条数上限等窗口控制也在本层处理
+ * （后续按需加，当前直接透传 ChatService 已截断过的快照）。</p>
  *
  * <p><b>健壮性</b>：模型不保证 100% 遵守"只输出 JSON"的指令，
  * 解析前会剥掉可能的 markdown 代码块围栏；JSON 不合法时抛
@@ -105,12 +113,14 @@ public class PlannerService {
      * 让模型修正后重试；总尝试次数为 {@code maxAttempts}（默认 2 = 首次 + 1 次重试）。
      * 超限后抛出<b>最后一次</b>异常（保留原类型与消息，由上层决定如何向用户报错）。</p>
      *
-     * @param goal 用户希望完成的最终目标（自然语言）
+     * @param goal    用户希望完成的最终目标（自然语言，仅本轮任务——多轮指代靠 history 消解）
+     * @param history 会话历史（多轮指代上下文；可为 null 或空——单轮对话无历史）。
+     *                只用于帮助模型理解 goal，不代表需要重新执行历史任务
      * @return 任务计划（goal + 步骤列表），已通过 PlanValidator 合法性校验
      * @throws IllegalStateException    重试耗尽，最后一次失败为模型无返回/内容为空/JSON 不合法
      * @throws IllegalArgumentException 重试耗尽，最后一次失败为计划语义不合法
      */
-    public Plan createPlan(String goal) {
+    public Plan createPlan(String goal, List<ChatMessage> history) {
 
         // 1. 获取默认模型客户端（重试间复用，WebClient 按连接缓存）
         LlmClientFactory.ResolvedLlmClient client =
@@ -124,7 +134,7 @@ public class PlannerService {
                     : goal + "\n\n[修正指令] 你上次生成的计划不合法：" + lastError.getMessage()
                             + "。请修正后重新输出完整计划 JSON。";
             try {
-                String content = callModel(client, userContent);
+                String content = callModel(client, userContent, history);
                 Plan plan = parsePlan(content, goal);
                 // 语义级合法性校验（唯一性 → 引用存在 → 无环），失败抛 IllegalArgumentException
                 planValidator.validate(plan);
@@ -146,13 +156,19 @@ public class PlannerService {
     /**
      * 调用模型并提取 content。
      *
+     * <p>messages 组装顺序：system → 历史（如有，原样保留 user/assistant 角色）→
+     * 当前 user 任务。历史在前的意义：模型按对话时序理解上下文，读到本轮任务时
+     * 指代已可解析。历史只用于理解，绝不触发对历史任务的重新规划。</p>
+     *
      * @param client      模型客户端
      * @param userContent 用户消息（首次为目标原文，重试时附带修正指令）
+     * @param history     会话历史（可为 null 或空，单轮对话）
      * @return 模型返回的 content 文本
      * @throws IllegalStateException 模型无返回或内容为空
      */
-    private String callModel(LlmClientFactory.ResolvedLlmClient client, String userContent) {
-        // 构建请求：system（规划 Prompt）+ user（用户目标 / 目标+修正指令）
+    private String callModel(LlmClientFactory.ResolvedLlmClient client, String userContent,
+                             List<ChatMessage> history) {
+        // 构建请求：system（规划 Prompt）+ 历史消息（如有）+ user（用户目标 / 目标+修正指令）
         ObjectNode request = objectMapper.createObjectNode();
         request.put("model", client.modelName());
         request.put("stream", false);
@@ -174,6 +190,15 @@ public class PlannerService {
         ObjectNode systemMessage = messages.addObject();
         systemMessage.put("role", "system");
         systemMessage.put("content", plannerPrompt);
+
+        // 历史消息放在当前用户任务之前（多轮指代上下文；只用于理解，不重新执行）
+        if (history != null) {
+            for (ChatMessage m : history) {
+                ObjectNode historyMessage = messages.addObject();
+                historyMessage.put("role", m.getRole());
+                historyMessage.put("content", m.getContent());
+            }
+        }
 
         ObjectNode userMessage = messages.addObject();
         userMessage.put("role", "user");
@@ -224,7 +249,11 @@ public class PlannerService {
             return objectMapper.treeToValue(root, Plan.class);
         } catch (JacksonException e) {
             log.error("Planner JSON 解析失败，模型返回内容: {}", content, e);
-            throw new IllegalStateException("Planner 返回的计划格式不正确", e);
+            // 异常消息附带 Jackson 的精确诊断（行列号/期望 token）——
+            // 该消息会进入重试的修正指令，模型能定向修复
+            // （实测出现过 "step_2" 丢键名这类语法错误，"格式不正确"太笼统盲改率低）
+            throw new IllegalStateException(
+                    "Planner 返回的计划 JSON 不合法: " + e.getMessage(), e);
         }
     }
 

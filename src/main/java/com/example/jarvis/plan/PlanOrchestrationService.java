@@ -1,5 +1,6 @@
 package com.example.jarvis.plan;
 
+import com.example.jarvis.domain.ChatMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -27,6 +28,11 @@ import java.util.List;
  * <p><b>关于二次校验</b>：{@link PlannerService#createPlan} 在 7.4 已内嵌
  * PlanValidator（重试机制依赖校验结果做修正反馈），此处再校验一次属
  * 防御性复核——协调层只放行自己验证过的 DAG 给调度器，代价 O(n) 可忽略。</p>
+ *
+ * <p><b>会话历史（多轮指代改造）</b>：history 作为独立参数透传给
+ * {@link PlannerService}——ChatService 负责获取历史，PlannerService 负责使用
+ * 历史（组装进模型消息、截断控制都在 Planner 层），goal 始终只表示本轮任务。
+ * 历史只用于理解上下文，不代表需要重新执行历史任务。</p>
  */
 @Service
 @Slf4j
@@ -40,17 +46,20 @@ public class PlanOrchestrationService {
     /**
      * 完整规划流程：生成计划 → 复核合法性 → 计算执行顺序 → 组装结果。
      *
-     * @param goal 用户希望完成的最终目标（自然语言）
+     * @param goal    用户希望完成的最终目标（自然语言，仅本轮任务）
+     * @param history 会话历史（多轮指代上下文；可为空——单轮对话无历史）。
+     *                只用于帮助模型理解 goal，不代表需要重新执行历史任务
      * @return 规划结果（原始计划 + 拓扑有序的执行顺序，同一批步骤的不同排列）
      * @throws IllegalStateException    模型输出重试耗尽仍无法解析
      * @throws IllegalArgumentException 计划语义不合法（重复 stepId / 引用缺失 / 循环依赖）
      */
-    public PlanResult createPlan(String goal) {
+    public PlanResult createPlan(String goal, List<ChatMessage> history) {
 
-        // 1. 生成计划（PlannerService 内部：调模型 → 解析 → 校验 → 失败带原因重试）
-        Plan plan = plannerService.createPlan(goal);
+        // 1. 生成计划（PlannerService 内部：调模型 → 解析 → 校验 → 失败带原因重试；
+        //    历史消息组装进模型 messages，帮助理解多轮指代）
+        Plan plan = plannerService.createPlan(goal, history);
 
-        // 2. 复核计划合法性（统一入口，内部按序执行三项检查；
+        // 2. 复核计划合法性（统一入口，内部按序执行四项检查；
         //    协调层防线：只放行验证过的 DAG 给调度器）
         planValidator.validate(plan);
 
@@ -60,8 +69,8 @@ public class PlanOrchestrationService {
         // 4. 组装规划结果（PlanResult 校验两份步骤为同一批不同排列）
         PlanResult result = new PlanResult(plan, executionOrder);
 
-        log.info("规划流程完成: goal={}, 步骤数={}, 执行顺序={}",
-                goal, plan.steps().size(),
+        log.info("规划流程完成: goal={}, 历史消息数={}, 步骤数={}, 执行顺序={}",
+                goal, history == null ? 0 : history.size(), plan.steps().size(),
                 executionOrder.stream().map(PlanStep::stepId).toList());
         return result;
     }

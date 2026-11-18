@@ -31,12 +31,14 @@ public class PlannerController {
     /**
      * 根据用户目标生成任务计划。
      *
+     * <p>独立测试接口无会话上下文，history 传空列表（单轮规划）。</p>
+     *
      * @param request 规划请求
      * @return 任务计划（goal + steps）
      */
     @PostMapping
     public Map<String, Object> createPlan(@Valid @RequestBody PlanCreateRequest request) {
-        Plan plan = plannerService.createPlan(request.getGoal());
+        Plan plan = plannerService.createPlan(request.getGoal(), List.of());
         return toResponse(request.getGoal(), plan);
     }
 
